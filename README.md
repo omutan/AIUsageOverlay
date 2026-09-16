@@ -29,6 +29,12 @@ It reads local usage files each app writes for itself (lock‑free, read‑only)
 
 Only the AIs you actually use will show data; disable the rest in Settings.
 
+The Claude row has a third bar, **Fable weekly**. That number is not in the
+usage file, so it is read from the Claude Desktop window while its usage popup
+is open (on ↻ Refresh, and once every 5 minutes otherwise). The last value that
+could be read is kept for up to 12 hours; after that the bar shows `—`. Reset
+times read from the same popup are shown by the 🕐 icon.
+
 ## Requirements
 - Windows 10/11
 - Python 3.9+ with Tkinter (standard), and: `pip install -r requirements.txt`
@@ -115,6 +121,12 @@ Windows用オーバーレイです。**APIキーもトークンもログイン�
 | その他 | —（自分で追加可） | — | — |
 
 使っているAIだけ数値が出ます。使っていないものは設定でOFFに。
+
+Claude の行には3本目のバー **Fable 週間残り** があります。この値は使用量
+ファイルには入っていないため、Claude デスクトップの使用量ポップアップを
+開いているときに画面から読み取ります（↻ 更新時と、ふだんは5分に1回）。
+最後に読めた値は12時間まで保持し、それより古くなると「—」になります。
+同じポップアップから読んだリセット時刻は 🕐 で確認できます。
 
 ### 必要なもの
 - Windows 10/11

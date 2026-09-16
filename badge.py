@@ -380,7 +380,11 @@ class Overlay:
             grid = tk.Frame(blk, bg=rbg)
             grid.grid(row=1, column=1, columnspan=2, sticky='w')
             bars = {}
-            for j, (lab, kk) in enumerate([('5時間残り', 'v5'), ('週間残り', 'vw')]):
+            labels = [('5時間残り', 'v5'), ('週間残り', 'vw')]
+            if p['type'] == 'claude_local':
+                # Claude だけ Fable の週間枠を3本目に出す。
+                labels.append(('Fable 週間残り', 'vf'))
+            for j, (lab, kk) in enumerate(labels):
                 tk.Label(grid, text=lab, bg=rbg, fg=T['label'], font=self.f_label
                          ).grid(row=j, column=0, sticky='w', padx=(0, int(7 * s)))
                 bc = tk.Canvas(grid, width=barw, height=barh, bg=rbg, highlightthickness=0, bd=0)
@@ -391,7 +395,9 @@ class Overlay:
                 bars[kk] = (bc, pl)
             nm.bind('<Button-1>', lambda e, pid=p['id']: self.open_provider_url(pid))
             self.rows[p['id']] = {'nm': nm, 'clock': ccv, 'bars': bars, 'color': pc, 'rbg': rbg,
-                                  'reset5': None, 'resetw': None, 'ptype': p['type'], 'url': None}
+                                  'reset5': None, 'resetw': None, 'ptype': p['type'], 'url': None,
+                                  'rtext5': None, 'rtextw': None, 'rtextf': None,
+                                  'drawn': {}}
 
     def _bind_drag_tree(self, w):
         w.bind('<Button-1>', self.start_move, add='+')
@@ -571,35 +577,58 @@ class Overlay:
             row['stale'] = bool(r.get('stale'))
             row['reset5'] = r.get('reset_five')
             row['resetw'] = r.get('reset_week')
+            row['rtext5'] = r.get('reset_five_text')
+            row['rtextw'] = r.get('reset_week_text')
+            row['rtextf'] = r.get('reset_fable_text')
             row['url'] = r.get('url')
+            drawn = row['drawn']
             if not r['ok']:
-                row['nm'].config(text=name + '（' + r.get('note', '') + '）')
-                for kk in ('v5', 'vw'):
-                    bc, pl = row['bars'][kk]
-                    draw_bar(bc, barw, barh, None, fill, track, T['glow'])
-                    if row['url']:
-                        pl.config(text='開く', fg=pc, cursor='hand2')
-                        row['nm'].config(cursor='hand2')
-                    else:
-                        pl.config(text='—', fg=T['label'], cursor='')
-                        row['nm'].config(cursor='')
+                hand = 'hand2' if row['url'] else ''
+                self._set_name(row, name + '（' + r.get('note', '') + '）', hand)
+                for kk in row['bars']:
+                    txt, col = (('開く', pc) if row['url'] else ('—', T['label']))
+                    self._set_bar(row, kk, None, txt, col, hand,
+                                  barw, barh, fill, track, T['glow'])
                 continue
             shown_name = name + ('（更新待ち）' if row['stale'] else '')
             hand = 'hand2' if row['url'] else ''
-            row['nm'].config(text=shown_name, cursor=hand)
-            for kk, used in (('v5', r['five']), ('vw', r['week'])):
-                bc, pl = row['bars'][kk]
+            self._set_name(row, shown_name, hand)
+            for kk, used in (('v5', r['five']), ('vw', r['week']),
+                             ('vf', r.get('fable_week'))):
+                if kk not in row['bars']:
+                    continue
                 remaining = (max(0, min(100, 100 - used))
                              if isinstance(used, (int, float)) else None)
-                draw_bar(bc, barw, barh, remaining, fill, track, T['glow'])
-                pl.config(text=(('%d%%' % remaining) if remaining is not None else '—'),
-                          fg=color_for(remaining, self.cfg, T), cursor='')
+                txt = ('%d%%' % remaining) if remaining is not None else '—'
+                self._set_bar(row, kk, remaining, txt,
+                              color_for(remaining, self.cfg, T), '',
+                              barw, barh, fill, track, T['glow'])
             newest = max(newest, r.get('t', 0))
         if newest:
             age = int((time.time() * 1000 - newest) / 60000)
-            self.foot.config(text='%d分前に更新' % max(0, age))
+            foot = '%d分前に更新' % max(0, age)
         else:
-            self.foot.config(text='')
+            foot = ''
+        if foot != getattr(self, '_foot_text', None):
+            self._foot_text = foot
+            self.foot.config(text=foot)
+
+    # 描画は「前回と変わったところだけ」。毎回描くとCPUを無駄に使う。
+    def _set_name(self, row, text, cursor):
+        if row['drawn'].get('nm') == (text, cursor):
+            return
+        row['drawn']['nm'] = (text, cursor)
+        row['nm'].config(text=text, cursor=cursor)
+
+    def _set_bar(self, row, kk, remaining, text, color, cursor,
+                 barw, barh, fill, track, glow):
+        key = (remaining, text, color, cursor, barw, barh, fill, track, glow)
+        if row['drawn'].get(kk) == key:
+            return
+        row['drawn'][kk] = key
+        bc, pl = row['bars'][kk]
+        draw_bar(bc, barw, barh, remaining, fill, track, glow)
+        pl.config(text=text, fg=color, cursor=cursor)
 
     def tick(self):
         self.refresh()
@@ -778,7 +807,10 @@ class Overlay:
         name = next((p['name'] for p in self.cfg['providers'] if p['id'] == pid), '')
         pt = row.get('ptype')
 
-        def line(lbl, ts, five):
+        def line(lbl, ts, text, five):
+            if text:
+                # Claude画面から読めたリセット文字列をそのまま出す。
+                return '%s: %s' % (lbl, text)
             if ts:
                 return '%s: %s' % (lbl, fmt_reset(ts))
             if pt == 'claude_local':
@@ -789,8 +821,13 @@ class Overlay:
                     activebackground=T['sel'], activeforeground=T['card'])
         m.add_command(label='%s の回復まで' % name, state='disabled')
         m.add_separator()
-        m.add_command(label=line('5時間枠', row.get('reset5'), True), state='disabled')
-        m.add_command(label=line('週間枠', row.get('resetw'), False), state='disabled')
+        m.add_command(label=line('5時間枠', row.get('reset5'), row.get('rtext5'), True),
+                      state='disabled')
+        m.add_command(label=line('週間枠', row.get('resetw'), row.get('rtextw'), False),
+                      state='disabled')
+        if 'vf' in row.get('bars', {}):
+            m.add_command(label=line('Fable 週間枠', None, row.get('rtextf'), False),
+                          state='disabled')
         px, py = self.root.winfo_pointerxy()
         try:
             m.tk_popup(px, py)

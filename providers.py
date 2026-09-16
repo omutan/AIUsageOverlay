@@ -4,7 +4,10 @@
 
 返り値の契約（常に全キーを揃える）:
   ok, five, week, plan, reset_five, reset_week, note, t, stale, url
-  five/week = 使用率%(0-100)。取れない枠は None。残り%への変換は表示側で行う。
+  さらに Claude では fable_week, fable_t, reset_five_text, reset_week_text,
+  reset_fable_text（UIAで読めたときだけ値が入る）。
+  five/week/fable_week = 使用率%(0-100)。取れない枠は None。
+  残り%への変換は表示側で行う。
 """
 import os, glob, json, re, time, subprocess
 from datetime import datetime
@@ -16,15 +19,23 @@ CLAUDE_APP_ID = r'shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude'
 CLAUDE_STALE_SECONDS = 180
 CODEX_TAIL_BYTES = 512 * 1024
 CODEX_MAX_FILES = 20
+FABLE_MAX_AGE = 12 * 3600     # UIAで読めたFable週間枠を保持する上限（秒）
+UIA_AUTO_INTERVAL = 300       # 定期更新でUIAを試す間隔（秒）
+CLAUDE_RUNNING_TTL = 60       # Claude起動確認（プロセス列挙）のキャッシュ（秒）
 CONTRACT_KEYS = ('ok', 'five', 'week', 'plan', 'reset_five', 'reset_week',
-                 'note', 't', 'stale', 'url')
+                 'note', 't', 'stale', 'url',
+                 'fable_week', 'fable_t',
+                 'reset_five_text', 'reset_week_text', 'reset_fable_text')
 
 
 def _result(**kw):
     """契約キーを必ず揃えた結果 dict を作る。"""
     base = {'ok': False, 'five': None, 'week': None, 'plan': None,
             'reset_five': None, 'reset_week': None, 'note': '',
-            't': 0, 'stale': False, 'url': None}
+            't': 0, 'stale': False, 'url': None,
+            'fable_week': None, 'fable_t': None,
+            'reset_five_text': None, 'reset_week_text': None,
+            'reset_fable_text': None}
     base.update(kw)
     return base
 
@@ -93,37 +104,94 @@ def _claude_window_handle():
         return None
 
 
+HEAD_MAX_LEN = 24     # 見出しは「週間 · 全モデル」程度。会話本文を拾わないための上限
+RESET_MAX_LEN = 30    # 「19:00 (金)にリセット」程度
+
+
+def _is_five_head(text):
+    return text == '5時間制限'
+
+
+def _is_week_head(text):
+    # 「週間 · 全モデル」「週次 · …」の表記ゆれを見る。Fable は別枠なので除く。
+    # 1行まとめ（「使用量：… 5時間制限のNN% …」）は見出しではないので除く。
+    return (len(text) <= HEAD_MAX_LEN
+            and ('週間' in text or '週次' in text)
+            and 'Fable' not in text and '5時間制限' not in text)
+
+
+def _is_fable_head(text):
+    # 会話本文にも Fable の語は出るので、短い要素だけを見出しとみなす。
+    return (len(text) <= HEAD_MAX_LEN
+            and re.search(r'Fable', text) is not None
+            and '5時間制限' not in text)
+
+
+def _pct_after(texts, is_head, span=6):
+    """見出しの直後 span 個から、単独の「NN%」を拾う。"""
+    for i, text in enumerate(texts):
+        if not is_head(text):
+            continue
+        for candidate in texts[i + 1:i + 1 + span]:
+            match = re.fullmatch(r'(\d+)%', candidate.strip())
+            if match:
+                return int(match.group(1))
+    return None
+
+
+POPUP_MARKER = 'プランの使用量上限'
+
+
+def _usage_popup_slice(texts):
+    """使用量ポップアップの部分だけを切り出す。Claudeの画面には会話本文も
+    含まれるため、見出し探しを本文まで広げると誤読する。
+    目印が無ければ（ポップアップが閉じていれば）全体を返す。"""
+    for i in range(len(texts) - 1, -1, -1):
+        if texts[i] == POPUP_MARKER:
+            return texts[i:]
+    return texts
+
+
+def _reset_after(texts, is_head, span=6):
+    """見出しの直後 span 個から、「リセット」を含む要素をそのまま返す。"""
+    for i, text in enumerate(texts):
+        if not is_head(text):
+            continue
+        for candidate in texts[i + 1:i + 1 + span]:
+            if 'リセット' in candidate and len(candidate) <= RESET_MAX_LEN:
+                return candidate
+    return None
+
+
 def _parse_claude_usage_names(names):
-    five = None
-    week = None
-    for name in names:
-        text = ' '.join(str(name).split())
+    """使用量ポップアップの要素名から、使用率とリセット文字列を取り出す。
+    ポップアップが閉じていると 1 行目の「使用量：… 5時間制限のNN% …」しか無い。
+    """
+    out = {'five': None, 'week': None, 'fable_week': None,
+           'reset_five_text': None, 'reset_week_text': None,
+           'reset_fable_text': None}
+    texts = [' '.join(str(name).split()) for name in names]
+    for text in texts:
         # 現行の Claude Desktop は「使用量：コンテキスト 389k / 1M (39%) 5時間制限の64% …」
         # のように 1 要素にまとまっているので、「5時間制限のNN%」を先に拾う。
         match = re.search(r'5時間制限の\s*(\d+)%', text)
         if match:
-            five = int(match.group(1))
+            out['five'] = int(match.group(1))
         match = re.search(r'5時間制限.*?(\d+)%.*?週間.*?(\d+)%', text)
         if match:
-            five, week = int(match.group(1)), int(match.group(2))
+            out['five'], out['week'] = int(match.group(1)), int(match.group(2))
             break
-    if five is None:
-        # 使用量ポップアップでは、ラベルと百分率が別要素になっている。
-        for i, name in enumerate(names):
-            text = ' '.join(str(name).split())
-            if text == '5時間制限':
-                for candidate in names[i + 1:i + 7]:
-                    match = re.fullmatch(r'(\d+)%', str(candidate).strip())
-                    if match:
-                        five = int(match.group(1)); break
-    if week is None:
-        for i, name in enumerate(names):
-            if '週間' in str(name):
-                for candidate in names[i + 1:i + 7]:
-                    match = re.fullmatch(r'(\d+)%', str(candidate).strip())
-                    if match:
-                        week = int(match.group(1)); break
-    return five, week
+    # 使用量ポップアップでは、見出しと百分率が別要素に分かれている。
+    popup = _usage_popup_slice(texts)
+    if out['five'] is None:
+        out['five'] = _pct_after(popup, _is_five_head)
+    if out['week'] is None:
+        out['week'] = _pct_after(popup, _is_week_head)
+    out['fable_week'] = _pct_after(popup, _is_fable_head)
+    out['reset_five_text'] = _reset_after(popup, _is_five_head)
+    out['reset_week_text'] = _reset_after(popup, _is_week_head)
+    out['reset_fable_text'] = _reset_after(popup, _is_fable_head)
+    return out
 
 
 RPC_E_CHANGED_MODE = -2147417850   # 同じスレッドを別のアパートメントにはできない
@@ -173,10 +241,11 @@ def _claude_uia_usage():
     except Exception:
         return None
     try:
-        five, week = _parse_claude_usage_names(_uia_collect_names(hwnd))
-        if five is None and week is None:
+        parsed = _parse_claude_usage_names(_uia_collect_names(hwnd))
+        if all(parsed[k] is None for k in ('five', 'week', 'fable_week')):
             return None
-        return {'five': five, 'week': week, 't': int(time.time() * 1000)}
+        parsed['t'] = int(time.time() * 1000)
+        return parsed
     except Exception:
         return None
     finally:
@@ -201,7 +270,21 @@ def _merge_claude_ui(result, ui_usage):
     return result
 
 
+_CLAUDE_RUNNING_CACHE = [0.0, False]   # [最後に調べた時刻, 結果]
+
+
 def _claude_is_running():
+    """プロセス列挙は重いので、CLAUDE_RUNNING_TTL 秒だけ結果を使い回す。"""
+    now = time.time()
+    if now - _CLAUDE_RUNNING_CACHE[0] < CLAUDE_RUNNING_TTL:
+        return _CLAUDE_RUNNING_CACHE[1]
+    value = _claude_is_running_now()
+    _CLAUDE_RUNNING_CACHE[0] = now
+    _CLAUDE_RUNNING_CACHE[1] = value
+    return value
+
+
+def _claude_is_running_now():
     try:
         import ctypes
         from ctypes import wintypes
@@ -251,6 +334,7 @@ def launch_claude_desktop():
     try:
         explorer = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'explorer.exe')
         subprocess.Popen([explorer, CLAUDE_APP_ID], close_fds=True)
+        _CLAUDE_RUNNING_CACHE[0] = 0.0   # 起動したので次は調べ直す
         return True
     except Exception:
         return False
@@ -258,6 +342,34 @@ def launch_claude_desktop():
 
 class ClaudeProvider(Provider):
     ptype = 'claude_local'
+
+    def __init__(self, cfg=None):
+        Provider.__init__(self, cfg)
+        # UIAでしか読めない情報（Fable週間枠・リセット文字列）を覚えておく。
+        self.ui_cache = {}
+        self._uia_tried = 0.0        # 最後にUIAを試した時刻（成否によらず記録）
+
+    def _store_ui(self, ui):
+        """読めたものだけ更新する（読めなかった項目は前の値を残す）。"""
+        if ui.get('fable_week') is not None:
+            self.ui_cache['fable_week'] = ui['fable_week']
+            self.ui_cache['fable_t'] = ui.get('t') or int(time.time() * 1000)
+        for key in ('reset_five_text', 'reset_week_text', 'reset_fable_text'):
+            if ui.get(key):
+                self.ui_cache[key] = ui[key]
+
+    def _merge_ui_cache(self, base):
+        """ポップアップが閉じていても、前に読めた値を出し続ける。"""
+        for key in ('reset_five_text', 'reset_week_text', 'reset_fable_text'):
+            if self.ui_cache.get(key):
+                base[key] = self.ui_cache[key]
+        fable_t = self.ui_cache.get('fable_t') or 0
+        base['fable_t'] = fable_t or None
+        if fable_t and (time.time() - fable_t / 1000.0) <= FABLE_MAX_AGE:
+            base['fable_week'] = self.ui_cache.get('fable_week')
+        else:
+            base['fable_week'] = None   # 古すぎる値は出さない
+        return base
 
     def _candidates(self):
         # 従来版とMicrosoft Store版では保存場所が異なる。
@@ -307,9 +419,16 @@ class ClaudeProvider(Provider):
                 base = _result(note='Claudeを開いて更新', url=CLAUDE_USAGE_URL,
                                stale=True)
         base = _claude_freshness(base)
-        if force:
-            # UIA走査は重いので、手動更新（↻）のときだけ行う。
-            base = _merge_claude_ui(base, _claude_uia_usage())
+        now = time.time()
+        # UIA走査は重いので、手動更新（↻）か、前回から UIA_AUTO_INTERVAL 秒
+        # 経ったときだけ試す。ポップアップが閉じていれば何も取れずに終わる。
+        if force or (now - self._uia_tried) >= UIA_AUTO_INTERVAL:
+            self._uia_tried = now
+            ui = _claude_uia_usage()
+            if ui:
+                base = _merge_claude_ui(base, ui)
+                self._store_ui(ui)
+        base = self._merge_ui_cache(base)
         # 仕様変更: 名前クリックで使用量ページを開けるよう、ok のときも url を入れる。
         base['url'] = CLAUDE_USAGE_URL
         if base.get('ok'):
