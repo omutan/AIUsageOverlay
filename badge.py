@@ -14,6 +14,7 @@ if getattr(sys, 'frozen', False):          # PyInstaller の .exe で実行時
 else:
     BASE = os.path.dirname(os.path.abspath(__file__))
 CFG = os.path.join(BASE, 'badge_config.json')
+CFG_EXAMPLE = os.path.join(BASE, 'badge_config.example.json')
 KEY = '#ff00fe'  # 透明色キー（角丸のため）
 
 DEFAULT_CFG = {
@@ -80,6 +81,13 @@ THEMES = {
 
 
 def load_cfg():
+    if not os.path.exists(CFG) and os.path.exists(CFG_EXAMPLE):
+        # 初回起動時は、同梱の例から設定ファイルを作る。
+        try:
+            import shutil
+            shutil.copyfile(CFG_EXAMPLE, CFG)
+        except Exception:
+            pass
     cfg = json.loads(json.dumps(DEFAULT_CFG))
     try:
         with open(CFG, encoding='utf-8') as f:

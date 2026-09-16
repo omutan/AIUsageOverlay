@@ -1,0 +1,15 @@
+{
+  "x": null,
+  "y": null,
+  "alpha": 0.95,
+  "interval_ms": 15000,
+  "scale": 1.0,
+  "theme": "pop",
+  "level_color": true,
+  "selected": "all",
+  "providers": [
+    {"id": "claude",  "name": "Claude",  "type": "claude_local", "enabled": true,  "icon": "moon", "color": "#c58af9"},
+    {"id": "chatgpt", "name": "ChatGPT", "type": "codex_local",  "enabled": true,  "icon": "bolt", "color": "#3fb6ff"},
+    {"id": "gemini",  "name": "Gemini",  "type": "none",         "enabled": false, "icon": "hex",  "color": "#9be15d"}
+  ]
+}

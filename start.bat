@@ -1,4 +1,12 @@
 @echo off
-REM AI Usage Overlay ã‚’èµ·å‹•ï¼ˆpythonw ãŒç„¡ã‘ã‚Œã° pythonï¼‰
+REM AI Usage Overlay ‚ğ‹N“®B’Tõ‡: py ƒ‰ƒ“ƒ`ƒƒ[ ¨ PATH ‚Ì pythonw ¨ Šù’èƒCƒ“ƒXƒg[ƒ‹æ
 cd /d "%~dp0"
-where pythonw >nul 2>nul && (start "" pythonw "%~dp0badge.py") || (start "" python "%~dp0badge.py")
+where pyw >nul 2>nul && (start "" pyw -3 "%~dp0badge.py" & exit /b)
+where pythonw >nul 2>nul && (start "" pythonw "%~dp0badge.py" & exit /b)
+for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*" "%ProgramFiles%\Python3*" "C:\Python3*") do (
+  if exist "%%~D\pythonw.exe" (start "" "%%~D\pythonw.exe" "%~dp0badge.py" & exit /b)
+)
+echo Python 3.9 ˆÈ~‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñBpython.org ‚©‚çƒCƒ“ƒXƒg[ƒ‹‚µA
+echo uAdd python.exe to PATHv‚Éƒ`ƒFƒbƒN‚ğ“ü‚ê‚Ä‚©‚çÄÀs‚µ‚Ä‚­‚¾‚³‚¢B
+pause
+exit /b 1
