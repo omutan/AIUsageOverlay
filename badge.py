@@ -284,6 +284,7 @@ class Overlay:
     # ---------- 描画 ----------
     def build(self):
         T = self.theme()
+        self._foot_text = None      # 作り直したら前回の描画内容は忘れる
         if self.content:
             self.cv.delete('all')
             self.content.destroy()
@@ -507,11 +508,14 @@ class Overlay:
             pass
 
     def provider_action(self, pid):
-        row = self.rows.get(pid)
-        if row and row.get('url'):
-            self.open_provider_url(pid)
-        else:
+        """時計マーク: リセット時刻が分かるなら出す。無ければ使用量ページを開く。
+        （使用量ページは名前のクリックでも開ける）"""
+        row = self.rows.get(pid) or {}
+        known = ('rtext5', 'rtextw', 'rtextf', 'reset5', 'resetw')
+        if any(row.get(k) for k in known) or not row.get('url'):
             self.show_reset(pid)
+        else:
+            self.open_provider_url(pid)
 
     # ---------- data ----------
     def refresh(self, force=False, done=None):

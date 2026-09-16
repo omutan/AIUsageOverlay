@@ -60,8 +60,9 @@ times read from the same popup are shown by the 🕐 icon.
 - **↻ Refresh**: re-read now. If Claude's file is stale and the app is closed,
   launches Claude Desktop and waits for the file to update.
 - **Click a provider name**: opens its usage page (Claude only for now).
-- **🕐 next to a name**: for AIs with a usage page, opens it; for the others,
-  shows the time until each window resets.
+- **🕐 next to a name**: shows the reset times — the ones read from Claude's
+  usage popup when available, otherwise the time until each window resets.
+  (To open the usage page, click the provider name.)
 - **✕**: hide to the system tray; click the tray icon → Show to bring it back.
 
 ## Colors (remaining %)
@@ -151,8 +152,9 @@ Claude の行には3本目のバー **Fable 週間残り** があります。こ
 - **↻ 更新**: その場で読み直します。Claudeのファイルが古く、アプリも閉じている
   ときは Claude デスクトップを起動して、ファイルが新しくなるまで待ちます。
 - **AI名をクリック**: そのAIの使用量ページを開きます（今のところClaudeのみ）
-- **🕐（名前の右）**: 使用量ページがあるAIはそのページを開き、無いAIは各枠の
-  回復までの時間を表示します
+- **🕐（名前の右）**: リセット時刻を表示します（Claude の使用量ポップアップから
+  読めたときはその時刻、読めないときは各枠の回復までの時間）。
+  使用量ページを開くのは「AI名をクリック」です
 - **✕**: トレイに格納。トレイのアイコン→「表示」で復帰
 
 ### 残り%の色

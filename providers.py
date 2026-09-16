@@ -19,7 +19,8 @@ CLAUDE_APP_ID = r'shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude'
 CLAUDE_STALE_SECONDS = 180
 CODEX_TAIL_BYTES = 512 * 1024
 CODEX_MAX_FILES = 20
-FABLE_MAX_AGE = 12 * 3600     # UIAで読めたFable週間枠を保持する上限（秒）
+FABLE_MAX_AGE = 12 * 3600     # UIAで読めたFable週間枠・週間リセットを保持する上限（秒）
+RESET_FIVE_MAX_AGE = 3600     # 5時間枠のリセット文字列は1時間で捨てる（すぐ古くなる）
 UIA_AUTO_INTERVAL = 300       # 定期更新でUIAを試す間隔（秒）
 CLAUDE_RUNNING_TTL = 60       # Claude起動確認（プロセス列挙）のキャッシュ（秒）
 CONTRACT_KEYS = ('ok', 'five', 'week', 'plan', 'reset_five', 'reset_week',
@@ -121,10 +122,8 @@ def _is_week_head(text):
 
 
 def _is_fable_head(text):
-    # 会話本文にも Fable の語は出るので、短い要素だけを見出しとみなす。
-    return (len(text) <= HEAD_MAX_LEN
-            and re.search(r'Fable', text) is not None
-            and '5時間制限' not in text)
+    # 会話本文にも Fable の語は出るので、見出しの形そのものだけを認める。
+    return re.match(r'週[次間]\s*[·・]\s*Fable', text) is not None
 
 
 def _pct_after(texts, is_head, span=6):
@@ -133,7 +132,7 @@ def _pct_after(texts, is_head, span=6):
         if not is_head(text):
             continue
         for candidate in texts[i + 1:i + 1 + span]:
-            match = re.fullmatch(r'(\d+)%', candidate.strip())
+            match = re.match(r'^(\d+)\s*[%％]$', candidate.strip())
             if match:
                 return int(match.group(1))
     return None
@@ -145,11 +144,11 @@ POPUP_MARKER = 'プランの使用量上限'
 def _usage_popup_slice(texts):
     """使用量ポップアップの部分だけを切り出す。Claudeの画面には会話本文も
     含まれるため、見出し探しを本文まで広げると誤読する。
-    目印が無ければ（ポップアップが閉じていれば）全体を返す。"""
+    目印が無ければ（ポップアップが閉じていれば）空にする。"""
     for i in range(len(texts) - 1, -1, -1):
         if texts[i] == POPUP_MARKER:
             return texts[i:]
-    return texts
+    return []
 
 
 def _reset_after(texts, is_head, span=6):
@@ -174,6 +173,9 @@ def _parse_claude_usage_names(names):
     for text in texts:
         # 現行の Claude Desktop は「使用量：コンテキスト 389k / 1M (39%) 5時間制限の64% …」
         # のように 1 要素にまとまっているので、「5時間制限のNN%」を先に拾う。
+        # 会話本文を誤読しないよう、「使用量」で始まる要素だけを見る。
+        if not text.startswith('使用量'):
+            continue
         match = re.search(r'5時間制限の\s*(\d+)%', text)
         if match:
             out['five'] = int(match.group(1))
@@ -349,26 +351,55 @@ class ClaudeProvider(Provider):
         self.ui_cache = {}
         self._uia_tried = 0.0        # 最後にUIAを試した時刻（成否によらず記録）
 
+    # リセット文字列ごとの保持時間
+    RESET_MAX_AGE = {'reset_five_text': RESET_FIVE_MAX_AGE,
+                     'reset_week_text': FABLE_MAX_AGE,
+                     'reset_fable_text': FABLE_MAX_AGE}
+
     def _store_ui(self, ui):
         """読めたものだけ更新する（読めなかった項目は前の値を残す）。"""
+        stamp = ui.get('t') or int(time.time() * 1000)
         if ui.get('fable_week') is not None:
             self.ui_cache['fable_week'] = ui['fable_week']
-            self.ui_cache['fable_t'] = ui.get('t') or int(time.time() * 1000)
-        for key in ('reset_five_text', 'reset_week_text', 'reset_fable_text'):
+            self.ui_cache['fable_t'] = stamp
+        if ui.get('five') is not None or ui.get('week') is not None:
+            # 画面で見えている値は、ファイルより新しいことがある。
+            if ui.get('five') is not None:
+                self.ui_cache['five'] = ui['five']
+            if ui.get('week') is not None:
+                self.ui_cache['week'] = ui['week']
+            self.ui_cache['t'] = stamp
+        for key in self.RESET_MAX_AGE:
             if ui.get(key):
                 self.ui_cache[key] = ui[key]
+                self.ui_cache[key + '_t'] = stamp
 
     def _merge_ui_cache(self, base):
         """ポップアップが閉じていても、前に読めた値を出し続ける。"""
-        for key in ('reset_five_text', 'reset_week_text', 'reset_fable_text'):
-            if self.ui_cache.get(key):
-                base[key] = self.ui_cache[key]
+        now = time.time()
+        for key, max_age in self.RESET_MAX_AGE.items():
+            text = self.ui_cache.get(key)
+            stamp = self.ui_cache.get(key + '_t') or 0
+            if text and stamp and (now - stamp / 1000.0) <= max_age:
+                base[key] = text
         fable_t = self.ui_cache.get('fable_t') or 0
         base['fable_t'] = fable_t or None
-        if fable_t and (time.time() - fable_t / 1000.0) <= FABLE_MAX_AGE:
+        if fable_t and (now - fable_t / 1000.0) <= FABLE_MAX_AGE:
             base['fable_week'] = self.ui_cache.get('fable_week')
         else:
             base['fable_week'] = None   # 古すぎる値は出さない
+        # 画面から読んだ値がファイルより新しいうちは、そちらを出し続ける。
+        # （↻ の直後に次の定期更新でファイルの古い値へ戻らないように）
+        ui_t = self.ui_cache.get('t') or 0
+        if (ui_t > (base.get('t') or 0)
+                and (now - ui_t / 1000.0) <= CLAUDE_STALE_SECONDS):
+            if self.ui_cache.get('five') is not None:
+                base['five'] = self.ui_cache['five']
+            if self.ui_cache.get('week') is not None:
+                base['week'] = self.ui_cache['week']
+            base['t'] = ui_t
+            base['stale'] = False
+            base['ok'] = base['five'] is not None or base['week'] is not None
         return base
 
     def _candidates(self):
