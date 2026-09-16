@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+badge_config.json
+build/
+dist/
+*.zip
