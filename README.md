@@ -1,5 +1,17 @@
 # AI Usage Overlay
 
+> **v0.9 preview** — a Windows prototype. It reads the usage files that Claude
+> and Codex save locally and shows the remaining %. It is an unofficial tool,
+> unrelated to any AI vendor. The numbers come from locally recorded data, so
+> they may lag behind your live usage, and a change in either app's file format
+> can stop them from being read.
+>
+> Known limitations: the Fable weekly value is kept in memory only (it shows
+> "—" after a restart until the usage popup is read again); the standalone
+> .exe build has not been re-verified for this version.
+>
+> Verified on: Windows 11 (build 26200), Python 3.13.2.
+
 A tiny always-on-top desktop overlay (Windows) that shows the **remaining %** of
 the **5‑hour** and **weekly** usage windows of multiple AI assistants at a
 glance — no API keys, no tokens, no login. It just reads the usage files those
@@ -102,6 +114,14 @@ Note: the .exe build has not been re-verified for this version.
 ---
 
 ## 日本語
+
+> **v0.9 preview — Windows向け試作版**
+> Claude / Codex が保存するローカルファイルを読み、残り使用率を表示します。各社とは無関係の非公式ツールです。
+> 表示はローカルに記録された情報に基づくため、最新の利用状況と一致しない場合があります。各アプリの仕様変更により取得できなくなる可能性があります。
+>
+> 既知の制限: Fable の週間値はメモリ上だけで保持します（再起動後は使用量ポップアップを読み直すまで「—」）。単体 .exe はこの版で再検証していません。
+>
+> 動作確認: Windows 11 (build 26200) / Python 3.13.2
 
 複数AIの **5時間枠 / 週間枠の残り%** を、画面の隅に常時最前面で小さく表示する
 Windows用オーバーレイです。**APIキーもトークンもログインも不要** — 各アプリが
