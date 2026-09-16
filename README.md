@@ -87,7 +87,8 @@ times read from the same popup are shown by the 🕐 icon.
 
 ## Others
 Gemini and other assistants are planned for a future version
-(manual input / auto-detect).
+(manual input / auto-detect). A provider with no data source (`"type": "none"`)
+is hidden from the overlay even when enabled, so the window never shows rows of dashes.
 
 ## Build a standalone .exe (optional)
 ```
@@ -176,6 +177,7 @@ Claude の行には3本目のバー **Fable 週間残り** があります。こ
 
 ### その他のAI
 Gemini など他の AI は今後対応予定です（手動入力／自動検出）。
+取得手段の無い AI（`"type": "none"`）は、有効にしていても小窓には表示しません（「—」だけの行を出さないため）。
 
 ### ライセンス
 MIT License（`LICENSE` 参照）
