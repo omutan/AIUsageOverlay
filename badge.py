@@ -3,7 +3,10 @@
 複数AIの 5時間枠・週間枠 を常時最前面の小窓で表示。API/トークン不要。
 テーマ: pastel / pop / neon を設定で切替。
 """
-import os, sys, json, threading, time, webbrowser
+import sys
+sys.coinit_flags = 0  # COINIT_MULTITHREADED: comtypes が import 時に使う。
+                      # UIA をワーカースレッドで動かすため、他の import より前に置く。
+import os, json, threading, time, webbrowser
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import colorchooser
@@ -529,7 +532,15 @@ class Overlay:
 
     def _apply_results(self, results, done):
         """UIスレッド。読み取り結果を各行へ描画する。"""
-        self._busy = False
+        try:
+            self._draw_results(results)
+        finally:
+            # 描画で失敗しても、次の更新と後続処理は必ず動かす。
+            self._busy = False
+            if done:
+                done(results)
+
+    def _draw_results(self, results):
         T = self.theme()
         s = float(self.cfg.get('scale', 1.0))
         barw = int(66 * s); barh = int(T['bar_h'] * s)
@@ -574,7 +585,8 @@ class Overlay:
                         row['nm'].config(cursor='')
                 continue
             shown_name = name + ('（更新待ち）' if row['stale'] else '')
-            row['nm'].config(text=shown_name, cursor='')
+            hand = 'hand2' if row['url'] else ''
+            row['nm'].config(text=shown_name, cursor=hand)
             for kk, used in (('v5', r['five']), ('vw', r['week'])):
                 bc, pl = row['bars'][kk]
                 remaining = (max(0, min(100, 100 - used))
@@ -588,8 +600,6 @@ class Overlay:
             self.foot.config(text='%d分前に更新' % max(0, age))
         else:
             self.foot.config(text='')
-        if done:
-            done(results)
 
     def tick(self):
         self.refresh()

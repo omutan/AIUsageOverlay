@@ -124,46 +124,65 @@ def _parse_claude_usage_names(names):
     return five, week
 
 
+RPC_E_CHANGED_MODE = -2147417850   # 同じスレッドを別のアパートメントにはできない
+
+
+def _uia_collect_names(hwnd):
+    """COMの操作をこの関数の中だけで完結させ、抜けた時点で参照を手放す。
+    （COMポインタが生きたまま CoUninitialize すると落ちることがある）"""
+    from comtypes.client import CreateObject, GetModule
+    GetModule('UIAutomationCore.dll')
+    from comtypes.gen import UIAutomationClient as UIA
+    automation = CreateObject(UIA.CUIAutomation, interface=UIA.IUIAutomation)
+    root = automation.ElementFromHandle(hwnd)
+    elements = root.FindAll(UIA.TreeScope_Subtree, automation.CreateTrueCondition())
+    names = []
+    for index in range(elements.Length):
+        try:
+            name = elements.GetElement(index).CurrentName
+            if name:
+                names.append(name)
+        except Exception:
+            continue
+    return names
+
+
 def _claude_uia_usage():
     """Claude画面に表示されている公式使用率を、読み取り専用で取得する。
     手動更新時にワーカースレッドから呼ばれるので、COMは毎回この場で初期化する。
+    （comtypes は import 時に sys.coinit_flags でアパートメントを決めるので、
+      呼び出し側は import より前に sys.coinit_flags = 0 を設定しておくこと）
     """
     hwnd = _claude_window_handle()
     if not hwnd:
         return None
     try:
         import comtypes
-        comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
     except Exception:
         return None
-    automation = None
+    initialized = False
     try:
-        from comtypes.client import CreateObject, GetModule
-        GetModule('UIAutomationCore.dll')
-        from comtypes.gen import UIAutomationClient as UIA
-        automation = CreateObject(UIA.CUIAutomation, interface=UIA.IUIAutomation)
-        root = automation.ElementFromHandle(hwnd)
-        elements = root.FindAll(UIA.TreeScope_Subtree, automation.CreateTrueCondition())
-        names = []
-        for index in range(elements.Length):
-            try:
-                name = elements.GetElement(index).CurrentName
-                if name:
-                    names.append(name)
-            except Exception:
-                continue
-        five, week = _parse_claude_usage_names(names)
+        comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        initialized = True
+    except OSError as exc:
+        # 既に別モードで初期化済みのスレッドなら、そのまま使う（解放もしない）。
+        if getattr(exc, 'winerror', None) != RPC_E_CHANGED_MODE:
+            return None
+    except Exception:
+        return None
+    try:
+        five, week = _parse_claude_usage_names(_uia_collect_names(hwnd))
         if five is None and week is None:
             return None
         return {'five': five, 'week': week, 't': int(time.time() * 1000)}
     except Exception:
         return None
     finally:
-        automation = None
-        try:
-            comtypes.CoUninitialize()
-        except Exception:
-            pass
+        if initialized:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
 
 
 def _merge_claude_ui(result, ui_usage):
@@ -377,10 +396,12 @@ class CodexProvider(Provider):
                 return _result(note='セッション無し')
             best = None
             best_epoch = 0.0
+            # mtime が古いファイルで打ち切ってはいけない。稼働中のセッションは
+            # 追記しても mtime が更新されないことがあり（実データで最終イベントが
+            # mtime より最大6.5時間新しい例がある）、あとから始まって終わった
+            # 別セッションを誤って採用してしまう。全件見ても、内容が変わって
+            # いないファイルは (mtime, size) キャッシュで再解析しないので軽い。
             for path, mtime in files:
-                # 更新時刻が採用中の値より古いファイルには、新しい値は無い。
-                if best is not None and mtime < best_epoch:
-                    break
                 key = _file_key(path)
                 hit, value = self._cached(path, key)
                 if not hit:
@@ -447,6 +468,9 @@ def read_provider(ptype, cfg=None, force=False):
 
 if __name__ == '__main__':
     import sys
+    # 単体実行のときは、ここで comtypes のアパートメントを決める。
+    # （badge.py から使うときは badge.py 側の設定に従う）
+    sys.coinit_flags = 0   # COINIT_MULTITHREADED
     force = '--force' in sys.argv
     for name in ('claude_local', 'codex_local'):
         for i in range(3):
