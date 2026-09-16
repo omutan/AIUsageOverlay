@@ -435,7 +435,10 @@ class Overlay:
 
     # ---------- providers / selection ----------
     def enabled_providers(self):
-        return [p for p in self.cfg['providers'] if p.get('enabled')]
+        # 自動取得の手段が無い AI（type='none'）は、有効にしてあっても小窓には出さない。
+        # 「—」が並ぶだけの行は情報にならないため。設定画面には引き続き表示される。
+        return [p for p in self.cfg['providers']
+                if p.get('enabled') and p.get('type', 'none') != 'none']
 
     def shown_providers(self):
         sel = self.cfg.get('selected', 'all')
