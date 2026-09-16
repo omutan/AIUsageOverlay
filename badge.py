@@ -261,6 +261,7 @@ class Overlay:
         self._winid = None
         self._drag = None
         self.tray = None
+        self._busy = False
         self.build()
         self.refresh()
         self.root.after(int(self.cfg['interval_ms']), self.tick)
@@ -468,7 +469,7 @@ class Overlay:
         T = self.theme()
         menu = tk.Menu(self.root, tearoff=0, bg=T['card'], fg=T['text'],
                        activebackground=T['sel'], activeforeground=T['card'])
-        menu.add_command(label='今すぐ更新', command=self.refresh)
+        menu.add_command(label='今すぐ更新', command=self.manual_refresh)
         menu.add_command(label='設定…', command=self.open_settings)
         menu.add_separator()
         menu.add_command(label='トレイに格納', command=self.hide_to_tray)
@@ -496,7 +497,31 @@ class Overlay:
             self.show_reset(pid)
 
     # ---------- data ----------
-    def refresh(self):
+    def refresh(self, force=False, done=None):
+        """読み取りはワーカースレッドに任せ、UIスレッドは待たせない。"""
+        if self._busy:
+            return
+        targets = [(p['id'], p['type']) for p in self.shown_providers()]
+        self._busy = True
+        threading.Thread(target=self._read_worker,
+                         args=(targets, force, done), daemon=True).start()
+
+    def _read_worker(self, targets, force, done):
+        """ワーカースレッド。tkinter / self.cfg / self.rows には触らない。"""
+        results = {}
+        for pid, ptype in targets:
+            try:
+                results[pid] = P.read_provider(ptype, force=force)
+            except Exception:
+                results[pid] = P._empty('読取失敗')
+        try:
+            self.root.after(0, self._apply_results, results, done)
+        except Exception:
+            pass  # 終了後は反映先が無い。
+
+    def _apply_results(self, results, done):
+        """UIスレッド。読み取り結果を各行へ描画する。"""
+        self._busy = False
         T = self.theme()
         s = float(self.cfg.get('scale', 1.0))
         barw = int(66 * s); barh = int(T['bar_h'] * s)
@@ -505,10 +530,12 @@ class Overlay:
         wash = T.get('row_wash')
         neutral = T.get('bar_neutral')
         newest = 0
-        for p in self.shown_providers():
-            row = self.rows.get(p['id'])
+        names = {p['id']: p.get('name', '') for p in self.cfg['providers']}
+        for pid, r in results.items():
+            row = self.rows.get(pid)
             if not row:
-                continue
+                continue  # 読み取り中に行が作り直された。
+            name = names.get(pid, '')
             pc = row['color']
             if neutral:
                 fill = neutral
@@ -522,13 +549,12 @@ class Overlay:
                 track = blend(pc, T['card'], 0.85)
             else:
                 track = T['track']
-            r = P.read_provider(p['type'])
             row['stale'] = bool(r.get('stale'))
             row['reset5'] = r.get('reset_five')
             row['resetw'] = r.get('reset_week')
             row['url'] = r.get('url')
             if not r['ok']:
-                row['nm'].config(text=p['name'] + '（' + r.get('note', '') + '）')
+                row['nm'].config(text=name + '（' + r.get('note', '') + '）')
                 for kk in ('v5', 'vw'):
                     bc, pl = row['bars'][kk]
                     draw_bar(bc, barw, barh, None, fill, track, T['glow'])
@@ -539,7 +565,7 @@ class Overlay:
                         pl.config(text='—', fg=T['label'], cursor='')
                         row['nm'].config(cursor='')
                 continue
-            shown_name = p['name'] + ('（更新待ち）' if row['stale'] else '')
+            shown_name = name + ('（更新待ち）' if row['stale'] else '')
             row['nm'].config(text=shown_name, cursor='')
             for kk, used in (('v5', r['five']), ('vw', r['week'])):
                 bc, pl = row['bars'][kk]
@@ -554,6 +580,8 @@ class Overlay:
             self.foot.config(text='%d分前に更新' % max(0, age))
         else:
             self.foot.config(text='')
+        if done:
+            done(results)
 
     def tick(self):
         self.refresh()
@@ -561,30 +589,37 @@ class Overlay:
 
     def manual_refresh(self):
         """画面上の更新ボタンから、待ち時間なしで再読み込みする。"""
-        try:
-            self.refresh_btn.config(text='↻ 更新中…')
-            self.root.update_idletasks()
-            self.refresh()
-            claude = self.rows.get('claude')
-            if claude and claude.get('stale'):
-                if P.launch_claude_desktop():
-                    self.refresh_btn.config(text='Claude更新中…')
-                    self.root.after(1000, lambda: self._poll_claude_refresh(0))
-                else:
-                    self.refresh_btn.config(text='Claudeを開いて')
-                return
-            self.refresh_btn.config(text='✓ 更新済み')
-            self.root.after(1400, lambda: self.refresh_btn.config(text='↻ 更新'))
-        except Exception:
-            self.refresh_btn.config(text='↻ 再試行')
+        if self._busy:
+            return
+        self.refresh_btn.config(text='↻ 更新中…')
+        self.refresh(force=True, done=self._after_manual)
+
+    def _after_manual(self, results):
+        claude = self.rows.get('claude')
+        if claude and claude.get('stale'):
+            if P.launch_claude_desktop():
+                self.refresh_btn.config(text='Claude更新中…')
+                self.root.after(1000, lambda: self._poll_claude_refresh(0))
+            else:
+                self.refresh_btn.config(text='Claudeを開いて')
+            return
+        self._btn_done()
+
+    def _btn_done(self):
+        self.refresh_btn.config(text='✓ 更新済み')
+        self.root.after(1400, lambda: self.refresh_btn.config(text='↻ 更新'))
 
     def _poll_claude_refresh(self, attempt):
         """Claude起動後、公式ファイルが新しくなるまで短時間だけ待つ。"""
-        self.refresh()
+        if self._busy:
+            self.root.after(1000, lambda: self._poll_claude_refresh(attempt))
+            return
+        self.refresh(force=False, done=lambda res: self._poll_check(attempt))
+
+    def _poll_check(self, attempt):
         claude = self.rows.get('claude')
         if not claude or not claude.get('stale'):
-            self.refresh_btn.config(text='✓ 更新済み')
-            self.root.after(1400, lambda: self.refresh_btn.config(text='↻ 更新'))
+            self._btn_done()
         elif attempt < 29:
             self.root.after(1000, lambda: self._poll_claude_refresh(attempt + 1))
         else:
@@ -606,7 +641,7 @@ class Overlay:
 
         menu = pystray.Menu(
             pystray.MenuItem('表示', self._tray_show, default=True),
-            pystray.MenuItem('今すぐ更新', lambda i, it: self.root.after(0, self.refresh)),
+            pystray.MenuItem('今すぐ更新', lambda i, it: self.root.after(0, self.manual_refresh)),
             pystray.MenuItem('設定', lambda i, it: self.root.after(0, self.open_settings)),
             pystray.MenuItem('終了', self._tray_quit),
         )

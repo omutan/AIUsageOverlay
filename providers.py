@@ -2,8 +2,9 @@
 """各AIの使用量を「ローカルのファイル」から読むプロバイダ群.
 どれも API/トークン不要。アプリ自身が書き出すファイルを読むだけ。
 
-返り値: dict(ok, five, week, plan, reset_five, reset_week, note)
-  five/week = 使用率%(0-100)。取れない枠は None。
+返り値の契約（常に全キーを揃える）:
+  ok, five, week, plan, reset_five, reset_week, note, t, stale, url
+  five/week = 使用率%(0-100)。取れない枠は None。残り%への変換は表示側で行う。
 """
 import os, glob, json, re, time, subprocess
 from datetime import datetime
@@ -13,16 +14,67 @@ HOME = os.path.expanduser('~')
 CLAUDE_USAGE_URL = 'https://claude.ai/settings/usage'
 CLAUDE_APP_ID = r'shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude'
 CLAUDE_STALE_SECONDS = 180
-_LAST_GOOD = {}
-_UIA_AUTOMATION = None
+CODEX_TAIL_BYTES = 512 * 1024
+CODEX_MAX_FILES = 20
+CONTRACT_KEYS = ('ok', 'five', 'week', 'plan', 'reset_five', 'reset_week',
+                 'note', 't', 'stale', 'url')
+
+
+def _result(**kw):
+    """契約キーを必ず揃えた結果 dict を作る。"""
+    base = {'ok': False, 'five': None, 'week': None, 'plan': None,
+            'reset_five': None, 'reset_week': None, 'note': '',
+            't': 0, 'stale': False, 'url': None}
+    base.update(kw)
+    return base
 
 
 def _empty(note='未取得', url=None):
-    result = {'ok': False, 'five': None, 'week': None, 'plan': None,
-              'reset_five': None, 'reset_week': None, 'note': note, 't': 0}
-    if url:
-        result['url'] = url
-    return result
+    """旧APIとの互換のために残す薄いラッパ。"""
+    return _result(note=note, url=url)
+
+
+def _file_key(path):
+    """ファイルの変化を見分ける鍵。読めなければ None。"""
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except Exception:
+        return None
+
+
+class Provider:
+    """読み取り関数とキャッシュ状態をまとめた基底クラス。"""
+
+    ptype = ''
+
+    def __init__(self, cfg=None):
+        self.cfg = cfg
+        self.last_good = None
+        self._keys = {}      # path -> _file_key
+        self._parsed = {}    # path -> 解析結果（None も保持する）
+
+    def read(self, force=False):
+        raise NotImplementedError
+
+    def _cached(self, path, key):
+        if key is not None and self._keys.get(path) == key:
+            return True, self._parsed.get(path)
+        return False, None
+
+    def _store(self, path, key, value):
+        if key is None:
+            self._keys.pop(path, None)
+            self._parsed.pop(path, None)
+            return
+        self._keys[path] = key
+        self._parsed[path] = value
+
+    def _prune(self, keep_paths):
+        keep = set(keep_paths)
+        for path in [p for p in self._keys if p not in keep]:
+            self._keys.pop(path, None)
+            self._parsed.pop(path, None)
 
 
 # ---------- Claude (クロ) ----------
@@ -73,21 +125,23 @@ def _parse_claude_usage_names(names):
 
 
 def _claude_uia_usage():
-    """Claude画面に表示されている公式使用率を、読み取り専用で取得する。"""
-    global _UIA_AUTOMATION
+    """Claude画面に表示されている公式使用率を、読み取り専用で取得する。
+    手動更新時にワーカースレッドから呼ばれるので、COMは毎回この場で初期化する。
+    """
     hwnd = _claude_window_handle()
     if not hwnd:
         return None
     try:
         import comtypes
+        comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+    except Exception:
+        return None
+    automation = None
+    try:
         from comtypes.client import CreateObject, GetModule
-        if _UIA_AUTOMATION is None:
-            comtypes.CoInitialize()
-            GetModule('UIAutomationCore.dll')
-            from comtypes.gen import UIAutomationClient as UIA
-            _UIA_AUTOMATION = (CreateObject(UIA.CUIAutomation,
-                                            interface=UIA.IUIAutomation), UIA)
-        automation, UIA = _UIA_AUTOMATION
+        GetModule('UIAutomationCore.dll')
+        from comtypes.gen import UIAutomationClient as UIA
+        automation = CreateObject(UIA.CUIAutomation, interface=UIA.IUIAutomation)
         root = automation.ElementFromHandle(hwnd)
         elements = root.FindAll(UIA.TreeScope_Subtree, automation.CreateTrueCondition())
         names = []
@@ -104,6 +158,12 @@ def _claude_uia_usage():
         return {'five': five, 'week': week, 't': int(time.time() * 1000)}
     except Exception:
         return None
+    finally:
+        automation = None
+        try:
+            comtypes.CoUninitialize()
+        except Exception:
+            pass
 
 
 def _merge_claude_ui(result, ui_usage):
@@ -175,63 +235,65 @@ def launch_claude_desktop():
         return False
 
 
-def claude_local(cfg=None):
-    ui_usage = _claude_uia_usage()
-    # 従来版とMicrosoft Store版では保存場所が異なる。
-    candidates = [os.path.join(APPDATA, 'Claude', 'plan-usage-history.json')]
-    local_appdata = os.environ.get('LOCALAPPDATA', '')
-    candidates += glob.glob(os.path.join(
-        local_appdata, 'Packages', 'Claude_*', 'LocalCache', 'Roaming',
-        'Claude', 'plan-usage-history.json'))
-    candidates = [p for p in candidates if os.path.isfile(p)]
-    candidates.sort(key=os.path.getmtime, reverse=True)
-    if not candidates:
-        cached = _LAST_GOOD.get('claude')
-        if cached:
-            result = _merge_claude_ui(_claude_freshness(cached), ui_usage)
-            _LAST_GOOD['claude'] = dict(result)
-            return result
-        if ui_usage:
-            result = _merge_claude_ui(_empty(''), ui_usage)
-            _LAST_GOOD['claude'] = dict(result)
-            return result
-        missing = _empty('Claudeを開いて更新', CLAUDE_USAGE_URL)
-        missing['stale'] = True
-        return missing
+class ClaudeProvider(Provider):
+    ptype = 'claude_local'
 
-    for path in candidates:
+    def _candidates(self):
+        # 従来版とMicrosoft Store版では保存場所が異なる。
+        paths = [os.path.join(APPDATA, 'Claude', 'plan-usage-history.json')]
+        local_appdata = os.environ.get('LOCALAPPDATA', '')
+        paths += glob.glob(os.path.join(
+            local_appdata, 'Packages', 'Claude_*', 'LocalCache', 'Roaming',
+            'Claude', 'plan-usage-history.json'))
+        return [p for p in paths if os.path.isfile(p)]
+
+    def _read_file(self, path):
+        """使用量ファイルを読んで結果に変換する。読めなければ None。"""
         for attempt in range(3):
             try:
                 with open(path, encoding='utf-8') as f:
                     d = json.load(f)
                 samples = d.get('samples', [])
                 if not samples:
-                    break
+                    return None
                 last = max(samples, key=lambda s: s.get('t', 0))
                 u = last.get('u', {})
-                result = {'ok': True, 'five': u.get('fh'), 'week': u.get('sd'),
-                          'plan': None, 'reset_five': None, 'reset_week': None,
-                          'note': ('⚠上限' if u.get('xu') == 100 else ''),
-                          't': last.get('t', 0)}
-                result = _merge_claude_ui(_claude_freshness(result), ui_usage)
-                _LAST_GOOD['claude'] = dict(result)
-                return result
+                return _result(ok=True, five=u.get('fh'), week=u.get('sd'),
+                               note=('⚠上限' if u.get('xu') == 100 else ''),
+                               t=last.get('t', 0))
             except Exception:
                 if attempt < 2:
                     time.sleep(0.08)
-        # 別の候補ファイルがあれば続けて試す。
-    cached = _LAST_GOOD.get('claude')
-    if cached:
-        result = _merge_claude_ui(_claude_freshness(cached), ui_usage)
-        _LAST_GOOD['claude'] = dict(result)
-        return result
-    if ui_usage:
-        result = _merge_claude_ui(_empty(''), ui_usage)
-        _LAST_GOOD['claude'] = dict(result)
-        return result
-    failed = _empty('Claudeを開いて更新', CLAUDE_USAGE_URL)
-    failed['stale'] = True
-    return failed
+        return None
+
+    def read(self, force=False):
+        paths = self._candidates()
+        base = None
+        for path in paths:
+            key = _file_key(path)
+            hit, value = self._cached(path, key)
+            if not hit:
+                value = self._read_file(path)
+                self._store(path, key, value)
+            if value and (base is None or value.get('t', 0) > base.get('t', 0)):
+                base = value
+        self._prune(paths)
+
+        if base is None:
+            if self.last_good:
+                base = dict(self.last_good)
+            else:
+                base = _result(note='Claudeを開いて更新', url=CLAUDE_USAGE_URL,
+                               stale=True)
+        base = _claude_freshness(base)
+        if force:
+            # UIA走査は重いので、手動更新（↻）のときだけ行う。
+            base = _merge_claude_ui(base, _claude_uia_usage())
+        # 仕様変更: 名前クリックで使用量ページを開けるよう、ok のときも url を入れる。
+        base['url'] = CLAUDE_USAGE_URL
+        if base.get('ok'):
+            self.last_good = dict(base)
+        return base
 
 
 # ---------- ChatGPT / Codex (レイ) ----------
@@ -264,69 +326,130 @@ def _limit_value(data, snake, camel):
     return data.get(camel) if value is None else value
 
 
-def codex_local(cfg=None):
-    sess = os.path.join(HOME, '.codex', 'sessions')
-    try:
+class CodexProvider(Provider):
+    ptype = 'codex_local'
+
+    def _list_files(self):
+        sess = os.path.join(HOME, '.codex', 'sessions')
         files = glob.glob(os.path.join(sess, '**', 'rollout-*.jsonl'), recursive=True)
-        if not files:
-            return _empty('セッション無し')
-        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        # 生テキスト検索では会話中に引用された古い値を誤認するため、各JSON行を
-        # 構造として読み、複数セッションのうち時刻が最も新しい実データを選ぶ。
-        rl = None
-        newest = 0.0
-        for p in files[:20]:
-            fallback = os.path.getmtime(p)
-            with open(p, encoding='utf-8', errors='ignore') as stream:
-                for line in stream:
+        stamped = []
+        for path in files:
+            try:
+                stamped.append((path, os.path.getmtime(path)))
+            except Exception:
+                continue
+        stamped.sort(key=lambda it: it[1], reverse=True)
+        return stamped[:CODEX_MAX_FILES]
+
+    def _scan_tail(self, path, fallback_mtime):
+        """末尾だけを後ろから走査し、最後の rate_limits を (dict, epoch) で返す。
+        生テキスト検索では会話中に引用された古い値を誤認するため、行ごとに
+        JSONとして読む。"""
+        with open(path, 'rb') as stream:
+            size = os.fstat(stream.fileno()).st_size
+            start = max(0, size - CODEX_TAIL_BYTES)
+            stream.seek(start)
+            buf = stream.read()
+        if start > 0:
+            cut = buf.find(b'\n')
+            buf = buf[cut + 1:] if cut >= 0 else b''
+        for line in reversed(buf.split(b'\n')):
+            if b'"rate_limits"' not in line and b'"rateLimits"' not in line:
+                continue
+            try:
+                event = json.loads(line.decode('utf-8', 'ignore'))
+            except Exception:
+                continue
+            epoch = _event_epoch(event, fallback_mtime)
+            for candidate in _rate_limit_dicts(event):
+                primary = candidate.get('primary') or {}
+                secondary = candidate.get('secondary') or {}
+                five = _limit_value(primary, 'used_percent', 'usedPercent')
+                week = _limit_value(secondary, 'used_percent', 'usedPercent')
+                if isinstance(five, (int, float)) or isinstance(week, (int, float)):
+                    return candidate, epoch
+        return None
+
+    def read(self, force=False):
+        try:
+            files = self._list_files()
+            if not files:
+                return _result(note='セッション無し')
+            best = None
+            best_epoch = 0.0
+            for path, mtime in files:
+                # 更新時刻が採用中の値より古いファイルには、新しい値は無い。
+                if best is not None and mtime < best_epoch:
+                    break
+                key = _file_key(path)
+                hit, value = self._cached(path, key)
+                if not hit:
                     try:
-                        event = json.loads(line)
+                        value = self._scan_tail(path, mtime)
                     except Exception:
-                        continue
-                    event_time = _event_epoch(event, fallback)
-                    for candidate in _rate_limit_dicts(event):
-                        primary = candidate.get('primary') or {}
-                        secondary = candidate.get('secondary') or {}
-                        five = _limit_value(primary, 'used_percent', 'usedPercent')
-                        week = _limit_value(secondary, 'used_percent', 'usedPercent')
-                        if (isinstance(five, (int, float)) or
-                                isinstance(week, (int, float))):
-                            if event_time >= newest:
-                                rl, newest = candidate, event_time
-        if not rl:
-            return _empty('レート情報無し')
-        pri = rl.get('primary') or {}
-        sec = rl.get('secondary') or {}
-        five = _limit_value(pri, 'used_percent', 'usedPercent')
-        week = _limit_value(sec, 'used_percent', 'usedPercent')
-        five = round(five) if isinstance(five, (int, float)) else None
-        week = round(week) if isinstance(week, (int, float)) else None
-        return {'ok': True, 'five': five, 'week': week,
-                'plan': _limit_value(rl, 'plan_type', 'planType'),
-                'reset_five': _limit_value(pri, 'resets_at', 'resetsAt'),
-                'reset_week': _limit_value(sec, 'resets_at', 'resetsAt'),
-                'note': '', 't': int(newest * 1000)}
-    except Exception as e:
-        return _empty('読取失敗')
+                        value = None
+                    self._store(path, key, value)
+                if value and value[1] > best_epoch:
+                    best, best_epoch = value
+            self._prune([p for p, _ in files])
+            if not best:
+                return _result(note='レート情報無し')
+            pri = best.get('primary') or {}
+            sec = best.get('secondary') or {}
+            five = _limit_value(pri, 'used_percent', 'usedPercent')
+            week = _limit_value(sec, 'used_percent', 'usedPercent')
+            five = round(five) if isinstance(five, (int, float)) else None
+            week = round(week) if isinstance(week, (int, float)) else None
+            result = _result(ok=True, five=five, week=week,
+                             plan=_limit_value(best, 'plan_type', 'planType'),
+                             reset_five=_limit_value(pri, 'resets_at', 'resetsAt'),
+                             reset_week=_limit_value(sec, 'resets_at', 'resetsAt'),
+                             t=int(best_epoch * 1000))
+            self.last_good = dict(result)
+            return result
+        except Exception:
+            if self.last_good:
+                return dict(self.last_good)
+            return _result(note='読取失敗')
 
 
 # ---------- 未対応 (ジェミ 等) ----------
-def none_provider(cfg=None):
-    return _empty('未対応')
+class NoneProvider(Provider):
+    ptype = 'none'
+
+    def read(self, force=False):
+        return _result(note='未対応')
 
 
 REGISTRY = {
-    'claude_local': claude_local,
-    'codex_local': codex_local,
-    'none': none_provider,
+    'claude_local': ClaudeProvider,
+    'codex_local': CodexProvider,
+    'none': NoneProvider,
 }
 
+_INSTANCES = {}
 
-def read_provider(ptype, cfg=None):
-    fn = REGISTRY.get(ptype, none_provider)
-    return fn(cfg)
+
+def get_provider(ptype, cfg=None):
+    """種類ごとに1つだけ実体を持ち、キャッシュを引き継ぐ。"""
+    inst = _INSTANCES.get(ptype)
+    if inst is None:
+        inst = REGISTRY.get(ptype, NoneProvider)(cfg)
+        _INSTANCES[ptype] = inst
+    else:
+        inst.cfg = cfg if cfg is not None else inst.cfg
+    return inst
+
+
+def read_provider(ptype, cfg=None, force=False):
+    return get_provider(ptype, cfg).read(force=force)
 
 
 if __name__ == '__main__':
-    print('claude:', claude_local())
-    print('codex :', codex_local())
+    import sys
+    force = '--force' in sys.argv
+    for name in ('claude_local', 'codex_local'):
+        for i in range(3):
+            t0 = time.perf_counter()
+            r = read_provider(name, force=force and i == 0)
+            print('%-12s #%d %.1fms %s' % (name, i, (time.perf_counter() - t0) * 1000, r))
