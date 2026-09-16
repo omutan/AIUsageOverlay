@@ -98,7 +98,9 @@ def _parse_claude_usage_names(names):
     week = None
     for name in names:
         text = ' '.join(str(name).split())
-        match = re.search(r'使用量[：:]\s*5時間制限の\s*(\d+)%', text)
+        # 現行の Claude Desktop は「使用量：コンテキスト 389k / 1M (39%) 5時間制限の64% …」
+        # のように 1 要素にまとまっているので、「5時間制限のNN%」を先に拾う。
+        match = re.search(r'5時間制限の\s*(\d+)%', text)
         if match:
             five = int(match.group(1))
         match = re.search(r'5時間制限.*?(\d+)%.*?週間.*?(\d+)%', text)
