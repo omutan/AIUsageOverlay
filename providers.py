@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """各AIの使用量を「ローカルのファイル」から読むプロバイダ群.
 どれも API/トークン不要。アプリ自身が書き出すファイルを読むだけ。
+例外は ChatGPT/Codex: 新しい Codex アプリは使用量をファイルに残さないので、
+同梱の公式 codex.exe（app-server）に「読むだけ」の問い合わせをする。
+認証は codex 自身が持つので、このツールはトークンに触れない。
 
 返り値の契約（常に全キーを揃える）:
   ok, five, week, plan, reset_five, reset_week, note, t, stale, url
@@ -9,7 +12,7 @@
   five/week/fable_week = 使用率%(0-100)。取れない枠は None。
   残り%への変換は表示側で行う。
 """
-import os, glob, json, re, time, subprocess
+import os, glob, json, re, time, subprocess, threading, queue
 from datetime import datetime
 
 APPDATA = os.environ.get('APPDATA', '')
@@ -19,6 +22,9 @@ CLAUDE_APP_ID = r'shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude'
 CLAUDE_STALE_SECONDS = 180
 CODEX_TAIL_BYTES = 512 * 1024
 CODEX_MAX_FILES = 20
+CODEX_LIVE_INTERVAL = 300     # 定期更新で codex app-server に問い合わせる間隔（秒）
+CODEX_LIVE_TIMEOUT = 15       # 問い合わせ1回の待ち上限（秒）
+CREATE_NO_WINDOW = 0x08000000
 FABLE_MAX_AGE = 12 * 3600     # UIAで読めたFable週間枠・週間リセットを保持する上限（秒）
 RESET_FIVE_MAX_AGE = 3600     # 5時間枠のリセット文字列は1時間で捨てる（すぐ古くなる）
 UIA_AUTO_INTERVAL = 300       # 定期更新でUIAを試す間隔（秒）
@@ -497,8 +503,143 @@ def _limit_value(data, snake, camel):
     return data.get(camel) if value is None else value
 
 
+def _codex_windows(limits):
+    """5時間枠と週間枠を、並び順ではなく枠の長さ（分）で見分ける。
+    長さが書かれていなければ primary=5時間、secondary=週間とみなす。"""
+    five = week = None
+    for key in ('primary', 'secondary'):
+        win = limits.get(key)
+        if not isinstance(win, dict):
+            continue
+        mins = _limit_value(win, 'window_minutes', 'windowDurationMins')
+        if isinstance(mins, (int, float)):
+            is_five = mins <= 24 * 60
+        else:
+            is_five = key == 'primary'
+        if is_five and five is None:
+            five = win
+        elif not is_five and week is None:
+            week = win
+    return five or {}, week or {}
+
+
+def _codex_result(limits, epoch, now=None):
+    """rate_limits（ファイル）/ rateLimits（app-server）を契約の形にする。"""
+    now = time.time() if now is None else now
+    five_win, week_win = _codex_windows(limits)
+    values = []
+    for win in (five_win, week_win):
+        used = _limit_value(win, 'used_percent', 'usedPercent')
+        used = round(used) if isinstance(used, (int, float)) else None
+        reset = _limit_value(win, 'resets_at', 'resetsAt')
+        # リセット時刻を過ぎた古い値は、その時点で使用 0% に戻っている。
+        # （その後に使った分は、次に新しい値が取れたときに反映される）
+        if used is not None and isinstance(reset, (int, float)) and reset <= now:
+            used, reset = 0, None
+        values += [used, reset]
+    reached = _limit_value(limits, 'rate_limit_reached_type', 'rateLimitReachedType')
+    return _result(ok=True, five=values[0], week=values[2],
+                   plan=_limit_value(limits, 'plan_type', 'planType'),
+                   reset_five=values[1], reset_week=values[3],
+                   note=('⚠上限' if reached else ''),
+                   t=int(epoch * 1000))
+
+
+def _codex_exe():
+    """Codex アプリ（または VS Code 拡張）に同梱の codex.exe。新しいもの優先。"""
+    local = os.environ.get('LOCALAPPDATA', '')
+    found = glob.glob(os.path.join(local, 'OpenAI', 'Codex', 'bin', '*', 'codex.exe'))
+    found += glob.glob(os.path.join(HOME, '.vscode', 'extensions', 'openai.chatgpt-*',
+                                    'bin', '*', 'codex.exe'))
+    stamped = []
+    for path in found:
+        try:
+            stamped.append((os.path.getmtime(path), path))
+        except Exception:
+            continue
+    return max(stamped)[1] if stamped else None
+
+
+def _codex_live_limits():
+    """公式の codex app-server に使用量を1回だけ問い合わせる（読むだけ）。
+    返り値は rateLimits の dict。取れなければ None。"""
+    exe = _codex_exe()
+    if not exe:
+        return None
+    try:
+        proc = subprocess.Popen([exe, 'app-server'], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                creationflags=CREATE_NO_WINDOW)
+    except Exception:
+        return None
+    lines = queue.Queue()
+
+    def pump():
+        try:
+            for raw in proc.stdout:
+                lines.put(raw)
+        except Exception:
+            pass
+    threading.Thread(target=pump, daemon=True).start()
+
+    def send(msg):
+        proc.stdin.write((json.dumps(msg) + '\n').encode('utf-8'))
+        proc.stdin.flush()
+
+    def wait_reply(msg_id, deadline):
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                return None
+            try:
+                raw = lines.get(timeout=left)
+            except queue.Empty:
+                return None
+            try:
+                msg = json.loads(raw.decode('utf-8', 'ignore'))
+            except Exception:
+                continue
+            if isinstance(msg, dict) and msg.get('id') == msg_id:
+                return msg
+
+    try:
+        deadline = time.time() + CODEX_LIVE_TIMEOUT
+        send({'id': 1, 'method': 'initialize',
+              'params': {'clientInfo': {'name': 'ai_usage_overlay',
+                                        'title': 'AIUsageOverlay',
+                                        'version': '0.9'}}})
+        if not wait_reply(1, deadline):
+            return None
+        send({'method': 'initialized'})
+        send({'id': 2, 'method': 'account/rateLimits/read'})
+        reply = wait_reply(2, deadline)
+        result = (reply or {}).get('result') or {}
+        by_id = result.get('rateLimitsByLimitId') or {}
+        limits = by_id.get('codex') or result.get('rateLimits')
+        return limits if isinstance(limits, dict) else None
+    except Exception:
+        return None
+    finally:
+        # stdin を閉じれば app-server は自分で終わる。終わらなければ止める。
+        try:
+            proc.stdin.close()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=CREATE_NO_WINDOW, timeout=5)
+            except Exception:
+                pass
+
+
 class CodexProvider(Provider):
     ptype = 'codex_local'
+
+    def __init__(self, cfg=None):
+        Provider.__init__(self, cfg)
+        self.live = None             # app-server から読めた (limits, epoch)
+        self._live_tried = 0.0       # 最後に app-server を試した時刻
 
     def _list_files(self):
         sess = os.path.join(HOME, '.codex', 'sessions')
@@ -543,11 +684,34 @@ class CodexProvider(Provider):
 
     def read(self, force=False):
         try:
-            files = self._list_files()
-            if not files:
-                return _result(note='セッション無し')
-            best = None
-            best_epoch = 0.0
+            now = time.time()
+            # 新しい Codex アプリは使用量をファイルに書かないので、手動更新（↻）か
+            # 前回から CODEX_LIVE_INTERVAL 秒経ったときに app-server へ問い合わせる。
+            if force or (now - self._live_tried) >= CODEX_LIVE_INTERVAL:
+                self._live_tried = now
+                limits = _codex_live_limits()
+                if limits:
+                    self.live = (limits, now)
+            best, best_epoch = self._read_files()
+            if self.live and self.live[1] >= best_epoch:
+                best, best_epoch = self.live
+            if not best:
+                return _result(note='レート情報無し')
+            result = _codex_result(best, best_epoch, now)
+            self.last_good = dict(result)
+            return result
+        except Exception:
+            if self.last_good:
+                return dict(self.last_good)
+            return _result(note='読取失敗')
+
+    def _read_files(self):
+        """従来の rollout-*.jsonl から、いちばん新しい rate_limits を探す。
+        （VS Code 拡張など、まだファイルに書く版のため残している）"""
+        files = self._list_files()
+        best = None
+        best_epoch = 0.0
+        if files:
             # mtime が古いファイルで打ち切ってはいけない。稼働中のセッションは
             # 追記しても mtime が更新されないことがあり（実データで最終イベントが
             # mtime より最大6.5時間新しい例がある）、あとから始まって終わった
@@ -564,26 +728,8 @@ class CodexProvider(Provider):
                     self._store(path, key, value)
                 if value and value[1] > best_epoch:
                     best, best_epoch = value
-            self._prune([p for p, _ in files])
-            if not best:
-                return _result(note='レート情報無し')
-            pri = best.get('primary') or {}
-            sec = best.get('secondary') or {}
-            five = _limit_value(pri, 'used_percent', 'usedPercent')
-            week = _limit_value(sec, 'used_percent', 'usedPercent')
-            five = round(five) if isinstance(five, (int, float)) else None
-            week = round(week) if isinstance(week, (int, float)) else None
-            result = _result(ok=True, five=five, week=week,
-                             plan=_limit_value(best, 'plan_type', 'planType'),
-                             reset_five=_limit_value(pri, 'resets_at', 'resetsAt'),
-                             reset_week=_limit_value(sec, 'resets_at', 'resetsAt'),
-                             t=int(best_epoch * 1000))
-            self.last_good = dict(result)
-            return result
-        except Exception:
-            if self.last_good:
-                return dict(self.last_good)
-            return _result(note='読取失敗')
+        self._prune([p for p, _ in files])
+        return best, best_epoch
 
 
 # ---------- 未対応 (ジェミ 等) ----------
