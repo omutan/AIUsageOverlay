@@ -7,3 +7,4 @@ dist/
 
 # 作業メーターの知らせの控え（PCごと）
 work_notified.json
+badge_config.json.*
