@@ -4,3 +4,6 @@ badge_config.json
 build/
 dist/
 *.zip
+
+# 作業メーターの知らせの控え（PCごと）
+work_notified.json

@@ -7,10 +7,12 @@ import sys
 sys.coinit_flags = 0  # COINIT_MULTITHREADED: comtypes が import 時に使う。
                       # UIA をワーカースレッドで動かすため、他の import より前に置く。
 import os, json, threading, time, webbrowser
+from datetime import datetime
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import colorchooser
 import providers as P
+import workmeter as WM
 
 if getattr(sys, 'frozen', False):          # PyInstaller の .exe で実行時
     BASE = os.path.dirname(sys.executable)  # 設定は exe と同じ場所に置く
@@ -276,6 +278,7 @@ class Overlay:
         self.build()
         self.refresh()
         self.root.after(int(self.cfg['interval_ms']), self.tick)
+        self.root.after(int(self.cfg.get('work_interval_ms', 5000)), self.tick_work)
         self.start_tray()
 
     def theme(self):
@@ -399,6 +402,80 @@ class Overlay:
                                   'reset5': None, 'resetw': None, 'ptype': p['type'], 'url': None,
                                   'rtext5': None, 'rtextw': None, 'rtextf': None,
                                   'drawn': {}}
+        # 作業メーター（進捗フックが書く current.json を読む）。行は作業の出入りに合わせて作り直す
+        self.work_box = tk.Frame(self.body, bg=T['card'])
+        self.work_box.pack(fill='x')
+        self.work_rows = {}
+        self._work_ids = None
+        if not hasattr(self, '_work_since'):
+            # 知らせの控え。小窓を起こす前に終わっていた作業は知らせない
+            self._work_since = datetime.now().astimezone()
+            self._work_notified_path = os.path.join(BASE, 'work_notified.json')
+            self._work_notified = WM.load_notified(self._work_notified_path)
+        self.refresh_work(first=True)
+
+    # ---------- 作業メーター ----------
+    def refresh_work(self, first=False):
+        """current.json を読み、動いている作業を1行ずつ出す。ファイルは小さいので UI スレッドで読む"""
+        if not self.cfg.get('work_meter', True):
+            return
+        try:
+            items = WM.current(self.cfg.get('work_meter_file') or None)
+        except Exception:
+            items = []
+        if self.cfg.get('work_notify', True):
+            try:
+                due = WM.due_notifications(items, self._work_notified, self._work_since)
+                for kind, it in due:
+                    WM.toast(*WM.notification_text(kind, it))
+                if due:
+                    WM.save_notified(self._work_notified_path, self._work_notified)
+            except Exception:
+                pass
+        ids = [i['id'] for i in items]
+        T = self.theme()
+        s = float(self.cfg.get('scale', 1.0))
+        if ids != self._work_ids:
+            self._work_ids = ids
+            for w in self.work_box.winfo_children():
+                w.destroy()
+            self.work_rows = {}
+            if items:
+                tk.Frame(self.work_box, bg=T['div'], height=1).pack(fill='x', pady=(int(5 * s), int(3 * s)))
+            for it in items:
+                blk = tk.Frame(self.work_box, bg=T['card'])
+                blk.pack(fill='x', pady=(int(1 * s), 0))
+                nm = tk.Label(blk, text='', bg=T['card'], fg=T['text'], font=self.f_label, anchor='w')
+                nm.grid(row=0, column=0, columnspan=2, sticky='w')
+                bc = tk.Canvas(blk, width=int(66 * s), height=int(T['bar_h'] * s), bg=T['card'],
+                               highlightthickness=0, bd=0)
+                bc.grid(row=1, column=0, pady=int(2 * s), sticky='w')
+                tx = tk.Label(blk, text='', bg=T['card'], fg=T['label'], font=self.f_label, anchor='w')
+                tx.grid(row=1, column=1, sticky='w', padx=(int(7 * s), 0))
+                self.work_rows[it['id']] = {'nm': nm, 'bar': bc, 'tx': tx, 'drawn': None}
+            if not first:
+                self._bind_drag_tree(self.work_box)
+                self.fit()
+        for it in items:
+            row = self.work_rows.get(it['id'])
+            if not row:
+                continue
+            color = T.get('bar_neutral') or '#ff9f43'
+            if it['finished']:
+                color = '#9be15d'
+            elif it['overrun']:
+                color = '#ff6b9d'
+            ai = f"{it['ai']}・" if it['ai'] else ''
+            name = ai + it['name']
+            if len(name) > 22:
+                name = name[:21] + '…'
+            key = (name, it['text'], int(it['pct']), color)
+            if row['drawn'] == key:
+                continue
+            row['drawn'] = key
+            row['nm'].config(text=name)
+            row['tx'].config(text=it['text'], fg=(color if (it['overrun'] or it['finished']) else T['label']))
+            draw_bar(row['bar'], int(66 * s), int(T['bar_h'] * s), it['pct'], color, T['track'], T['glow'])
 
     def _bind_drag_tree(self, w):
         w.bind('<Button-1>', self.start_move, add='+')
@@ -640,6 +717,14 @@ class Overlay:
     def tick(self):
         self.refresh()
         self.root.after(int(self.cfg['interval_ms']), self.tick)
+
+    def tick_work(self):
+        # 作業メーターは経過分が変わるので、使用量より短い間隔（5秒）で読み直す
+        try:
+            self.refresh_work()
+        except Exception:
+            pass
+        self.root.after(int(self.cfg.get('work_interval_ms', 5000)), self.tick_work)
 
     def manual_refresh(self):
         """画面上の更新ボタンから、待ち時間なしで再読み込みする。"""
