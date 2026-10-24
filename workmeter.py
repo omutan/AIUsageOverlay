@@ -29,8 +29,11 @@ import subprocess
 import threading
 from datetime import datetime, timedelta
 
-DEFAULT_FILE = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')),
-                            'ProgressHooks', 'work', 'current.json')
+# 置き場は %USERPROFILE%\.claude\ProgressHooks（2026-10-24 に %LOCALAPPDATA% から移した）。
+# Claude アプリはパッケージ化アプリで、アプリが起こした子プロセス（進捗フックも）は %LOCALAPPDATA% への
+# 読み書きが Packages\Claude_*\LocalCache\Local の写しに振り替えられ、外で動く小窓から見えなかったため。
+DEFAULT_FILE = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')),
+                            '.claude', 'ProgressHooks', 'work', 'current.json')
 SHOW_DONE_MIN = 10        # 終わった作業を「完了」として出し続ける分数
 OVERRUN_RATIO = 1.5       # 目安の上限 × これ を超えたら「遅れ」
 CORR_PROJECT_N = 5        # 補正: 同じプロジェクトの直近何件を見るか
@@ -99,8 +102,8 @@ def _ratios(recs):
         if lo is None or hi is None or act is None:
             continue
         mid = (float(lo) + float(hi)) / 2.0
-        if mid <= 0 or act < 1:
-            continue
+        if mid <= 0 or act < 1 or float(hi) < 3:
+            continue   # 1分未満で終わった作業、目安3分未満の小さな作業は比がぶれるので数えない
         out.append(float(act) / mid)
     return out
 
@@ -167,9 +170,10 @@ def describe(t, now=None, history=None):
     done = sum(1 for s in steps if s.get('status') == 'completed')
     st = _parse(t.get('started_at') or '')
     fin = _parse(t.get('finished_at') or '')
+    wait = _parse(t.get('waiting_since') or '') if not fin else None   # 質問で終わり、返事を待っている
     if st is None:
         return {'show': False}
-    end = fin or now
+    end = fin or wait or now
     elapsed = max(0.0, (end - st).total_seconds() / 60.0)
     est_lo, est_hi = t.get('estimate_min'), t.get('estimate_max')
     raw_lo, raw_hi = est_lo, est_hi
@@ -191,9 +195,16 @@ def describe(t, now=None, history=None):
         'factor': factor, 'corr_n': corr_n, 'corr_scope': corr_scope,
         'finished': bool(fin),
         'finished_at': fin,
+        'waiting': bool(wait),
         'overrun': False,
         'show': True,
     }
+    if wait:
+        # 待っている間は時間を進めない。遅れの判定も知らせもしない
+        parts = [f'{done}/{total}'] if total else []
+        parts += [fmt_min(elapsed), '返事待ち']
+        out['text'] = '・'.join(parts)
+        return out
     if fin:
         if (now - fin).total_seconds() / 60.0 > SHOW_DONE_MIN:
             out['show'] = False
@@ -225,7 +236,7 @@ def current(path=None, now=None, with_history=True):
     history = load_history(path) if with_history else None
     items = [describe(t, now, history) for t in load(path)]
     items = [i for i in items if i.get('show')]
-    items.sort(key=lambda i: (i['finished'], -i['elapsed']))
+    items.sort(key=lambda i: (i['finished'], i.get('waiting', False), -i['elapsed']))
     return items
 
 

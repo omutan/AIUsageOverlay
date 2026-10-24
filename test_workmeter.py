@@ -55,6 +55,12 @@ check('1h 終わって10分過ぎたら出さない', not d['show'], '')
 check('1i 上限が2時間以上なら両方とも時間で', WM.fmt_range(100, 300) == '1.7〜5.0時間' and WM.fmt_min(130) == '2.2時間'
       and WM.fmt_range(150, 210) == '2.5〜3.5時間', WM.fmt_range(100, 300))
 
+d = WM.describe(task(waiting_since=(NOW - timedelta(minutes=2)).isoformat()), NOW)
+check('1j 返事待ち: 時間を止めて「返事待ち」・遅れにしない', d['waiting'] and d['text'] == '3/7・10分・返事待ち' and not d['overrun'], d['text'])
+d = WM.describe(task(waiting_since=(NOW - timedelta(minutes=2)).isoformat(),
+                     started_at=(NOW - timedelta(minutes=60)).isoformat()), NOW)
+check('1j 返事待ちなら目安を大きく超えていても知らせない', not d['overrun'] and WM.due_notifications([d], {}, NOW - timedelta(hours=1), NOW) == [], d['text'])
+
 # ---- 実績による補正
 hist0 = [rec(1), rec(2)]
 f, n, sc = WM.correction('P023', hist0)
@@ -71,6 +77,8 @@ f, n, sc = WM.correction('P023', other)
 check('2d 同じプロジェクトが無ければ全体の直近（×1.0・all）', abs(f - 1.0) < 1e-6 and sc == 'all' and n == 3, f'{f} {n} {sc}')
 f, n, sc = WM.correction('P023', [rec(i, actual=0) for i in range(5)])
 check('2e 1分未満の実績は数えない', n == 0, f'{f} {n}')
+f, n, sc = WM.correction('P023', [rec(i, est=(1, 2), actual=20) for i in range(5)])
+check('2e 目安3分未満の小さな作業も数えない', n == 0, f'{f} {n}')
 f, n, sc = WM.correction('P023', [rec(i, actual=900) for i in range(3)])
 check('2f 比は3.0までに収める', f == 3.0, str(f))
 f, n, sc = WM.correction('P023', [rec(i, actual=1) for i in range(3)])

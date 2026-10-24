@@ -200,9 +200,9 @@ Gemini など他の AI は今後対応予定です（手動入力／自動検出
 取得手段の無い AI（`"type": "none"`）は、有効にしていても小窓には表示しません（「—」だけの行を出さないため）。
 
 ### 作業メーター（2026-10-24 追加）
-シロ（Claude Code）の進捗フックが書く `%LOCALAPPDATA%\ProgressHooks\work\current.json` を5秒ごとに読み、
+シロ（Claude Code）の進捗フックが書く `%USERPROFILE%\.claude\ProgressHooks\work\current.json` を5秒ごとに読み（2026-10-24 に `%LOCALAPPDATA%` から移動。Claude アプリの子プロセスは `%LOCALAPPDATA%` が写しに振り替えられ、外で動く小窓から見えなかったため）、
 使用量の下に「動いている作業」を1行ずつ出します（例：`シロ・P023 作業メーター` ／ `3/7・12分経過・あと8〜13分`）。
-終わった作業は10分だけ「完了 22分（目安15〜25分）」と残り、目安の上限の1.5倍を超えると「遅れ」が付きます。
+終わった作業は10分だけ「完了 22分（目安15〜25分）」と残り、目安の上限の1.5倍を超えると「遅れ」が付きます。質問で止まって返事を待っている作業は「3/7・12分・返事待ち」と出て、時間も知らせも止まります。
 
 - 残り時間：目安 × 残りの段階の割合と、ここまでの速さ（経過 ÷ 終わった段階 × 残り）を合わせた幅。
 - 実績による補正：同じフォルダの `history.jsonl`（終わった作業の目安と実際の分）から「実際 ÷ 目安の真ん中」の中央値を取り、目安に掛けます。
@@ -210,7 +210,7 @@ Gemini など他の AI は今後対応予定です（手動入力／自動検出
 - 知らせ：終わったとき1回と、目安の上限 × 1.5 を超えたとき1回、音なしの Windows 通知（`<audio silent="true"/>`）。作業ごとに1回だけで、
   控えは `work_notified.json`（小窓を立て直しても繰り返さない）。小窓を起こす前に終わっていた作業は知らせません。
 - 設定：`badge_config.json` の `"work_meter": false` で行を消す、`"work_notify": false` で知らせを止める、`"work_meter_file"` で読む場所を変える、`"work_interval_ms"`（既定5000）で読む間隔。
-- 計算は `workmeter.py`（tkinter なし）。机上テストは `python test_workmeter.py`（32項目）。`python workmeter.py` で今の表示、`python workmeter.py toast` で試しの通知。
+- 計算は `workmeter.py`（tkinter なし）。机上テストは `python test_workmeter.py`（35項目）。`python workmeter.py` で今の表示、`python workmeter.py toast` で試しの通知。
 
 ### ライセンス
 MIT License（`LICENSE` 参照）
