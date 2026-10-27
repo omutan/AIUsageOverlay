@@ -252,6 +252,33 @@ def fmt_reset(ts):
     return '%dh%02dm後' % (h, m)
 
 
+# 読み取った使用量を、ほかの道具（AIHub の左の欄）が読めるように置く。
+# 置き場は %USERPROFILE%\.aiusage\now.json（%LOCALAPPDATA% は Claude アプリの子プロセスから写しに振り替えられることがあるので使わない）。
+# 中身は使用率・リセット時刻・短い注記だけ（URL・個人の情報は入れない）。書けなくても小窓は止めない。
+SHARED_USAGE_PATH = os.path.join(os.path.expanduser('~'), '.aiusage', 'now.json')
+SHARED_KEYS = ('ok', 'five', 'week', 'fable_week', 'plan', 'reset_five', 'reset_week',
+               'reset_five_text', 'reset_week_text', 'reset_fable_text', 'note', 't', 'stale')
+
+
+def write_shared_usage(targets, results, path=SHARED_USAGE_PATH):
+    try:
+        rows = []
+        for pid, ptype, name in targets:
+            r = results.get(pid) or {}
+            row = {'id': pid, 'type': ptype, 'name': name}
+            row.update({k: r.get(k) for k in SHARED_KEYS})
+            rows.append(row)
+        data = {'v': 1, 'written_at': int(time.time() * 1000),
+                'source': 'AIUsageOverlay', 'providers': rows}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 class Overlay:
     def __init__(self):
         self.cfg = load_cfg()
@@ -602,7 +629,8 @@ class Overlay:
         """読み取りはワーカースレッドに任せ、UIスレッドは待たせない。"""
         if self._busy:
             return
-        targets = [(p['id'], p['type']) for p in self.shown_providers()]
+        targets = [(p['id'], p['type'], p.get('name', ''))
+                   for p in self.shown_providers()]
         self._busy = True
         threading.Thread(target=self._read_worker,
                          args=(targets, force, done), daemon=True).start()
@@ -610,11 +638,12 @@ class Overlay:
     def _read_worker(self, targets, force, done):
         """ワーカースレッド。tkinter / self.cfg / self.rows には触らない。"""
         results = {}
-        for pid, ptype in targets:
+        for pid, ptype, _name in targets:
             try:
                 results[pid] = P.read_provider(ptype, force=force)
             except Exception:
                 results[pid] = P._empty('読取失敗')
+        write_shared_usage(targets, results)
         try:
             self.root.after(0, self._apply_results, results, done)
         except Exception:
