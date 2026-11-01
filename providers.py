@@ -3,7 +3,9 @@
 どれも API/トークン不要。アプリ自身が書き出すファイルを読むだけ。
 例外は ChatGPT/Codex: 新しい Codex アプリは使用量をファイルに残さないので、
 同梱の公式 codex.exe（app-server）に「読むだけ」の問い合わせをする。
-認証は codex 自身が持つので、このツールはトークンに触れない。
+Claude も同じ: アプリのファイルは1日に数回しか書かれないので、同梱の
+claude.exe に get_usage（使用量だけを聞く問い合わせ）をする。
+認証は codex / claude 自身が持つので、このツールはトークンに触れない。
 
 返り値の契約（常に全キーを揃える）:
   ok, five, week, plan, reset_five, reset_week, note, t, stale, url
@@ -20,6 +22,8 @@ HOME = os.path.expanduser('~')
 CLAUDE_USAGE_URL = 'https://claude.ai/settings/usage'
 CLAUDE_APP_ID = r'shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude'
 CLAUDE_STALE_SECONDS = 180
+CLAUDE_LIVE_INTERVAL = 300    # 定期更新で claude.exe に get_usage を聞く間隔（秒）
+CLAUDE_LIVE_TIMEOUT = 15      # 問い合わせ1回の待ち上限（秒）
 CODEX_TAIL_BYTES = 512 * 1024
 CODEX_MAX_FILES = 20
 CODEX_LIVE_INTERVAL = 300     # 定期更新で codex app-server に問い合わせる間隔（秒）
@@ -348,6 +352,155 @@ def launch_claude_desktop():
         return False
 
 
+def _claude_code_exe():
+    """Claude アプリに同梱の claude.exe（Claude Code）。新しいもの優先。"""
+    local = os.environ.get('LOCALAPPDATA', '')
+    found = glob.glob(os.path.join(local, 'Claude-Data', 'claude_*', 'claude-code',
+                                   '*', '*', 'claude.exe'))
+    found += glob.glob(os.path.join(local, 'Packages', 'Claude_*', 'LocalCache',
+                                    'Roaming', 'Claude', 'claude-code',
+                                    '*', '*', 'claude.exe'))
+    stamped = []
+    for path in found:
+        try:
+            stamped.append((os.path.getmtime(path), path))
+        except Exception:
+            continue
+    return max(stamped)[1] if stamped else None
+
+
+def _iso_epoch(text):
+    if not isinstance(text, str):
+        return None
+    try:
+        return datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp()
+    except Exception:
+        return None
+
+
+def _claude_live_result(usage, epoch, now=None):
+    """get_usage の答えを契約の形にする。読めなければ None。
+    limits[]（サーバーの行）を kind で見分け、無ければ five_hour/seven_day を使う。"""
+    now = time.time() if now is None else now
+    rl = (usage or {}).get('rate_limits') or {}
+    five = week = fable = None
+    for row in rl.get('limits') or []:
+        if not isinstance(row, dict):
+            continue
+        kind = row.get('kind')
+        model = ((row.get('scope') or {}).get('model') or {}).get('display_name') or ''
+        pair = (row.get('percent'), _iso_epoch(row.get('resets_at')))
+        if kind == 'session' and five is None:
+            five = pair
+        elif kind == 'weekly_all' and week is None:
+            week = pair
+        elif kind == 'weekly_scoped' and 'fable' in model.lower() and fable is None:
+            fable = pair
+    for key, cur in (('five_hour', five), ('seven_day', week)):
+        win = rl.get(key)
+        if cur is None and isinstance(win, dict):
+            pair = (win.get('utilization'), _iso_epoch(win.get('resets_at')))
+            if key == 'five_hour':
+                five = pair
+            else:
+                week = pair
+    values = []
+    for pair in (five, week, fable):
+        used, reset = pair or (None, None)
+        used = round(used) if isinstance(used, (int, float)) else None
+        # リセット時刻を過ぎた値は、その時点で使用 0% に戻っている。
+        if used is not None and reset is not None and reset <= now:
+            used, reset = 0, None
+        values += [used, reset]
+    if values[0] is None and values[2] is None:
+        return None
+    reached = any(v is not None and v >= 100 for v in values[0::2])
+    stamp = int(epoch * 1000)
+    return _result(ok=True, five=values[0], week=values[2],
+                   plan=usage.get('subscription_type'),
+                   reset_five=values[1], reset_week=values[3],
+                   fable_week=values[4],
+                   fable_t=(stamp if values[4] is not None else None),
+                   note=('⚠上限' if reached else ''), t=stamp)
+
+
+def _claude_live_usage():
+    """同梱の claude.exe に get_usage を1回だけ聞く（読むだけ・AI には問いかけない）。
+    返り値は get_usage の response の dict。取れなければ None。"""
+    exe = _claude_code_exe()
+    if not exe:
+        return None
+    # 会話のフォルダの決まり（CLAUDE.md など）を読ませないよう、空のフォルダで動かす。
+    cwd = os.path.join(os.environ.get('TEMP', HOME), 'AIUsageOverlay_claude')
+    try:
+        os.makedirs(cwd, exist_ok=True)
+        proc = subprocess.Popen([exe, '-p', '--input-format', 'stream-json',
+                                 '--output-format', 'stream-json', '--verbose'],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, cwd=cwd,
+                                creationflags=CREATE_NO_WINDOW)
+    except Exception:
+        return None
+    lines = queue.Queue()
+
+    def pump():
+        try:
+            for raw in proc.stdout:
+                lines.put(raw)
+        except Exception:
+            pass
+    threading.Thread(target=pump, daemon=True).start()
+
+    def send(msg):
+        proc.stdin.write((json.dumps(msg) + '\n').encode('utf-8'))
+        proc.stdin.flush()
+
+    def wait_reply(req_id, deadline):
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                return None
+            try:
+                raw = lines.get(timeout=left)
+            except queue.Empty:
+                return None
+            try:
+                msg = json.loads(raw.decode('utf-8', 'ignore'))
+            except Exception:
+                continue
+            if (isinstance(msg, dict) and msg.get('type') == 'control_response'
+                    and (msg.get('response') or {}).get('request_id') == req_id):
+                return msg['response']
+
+    try:
+        deadline = time.time() + CLAUDE_LIVE_TIMEOUT
+        send({'type': 'control_request', 'request_id': 'aiusage-init',
+              'request': {'subtype': 'initialize'}})
+        if not wait_reply('aiusage-init', deadline):
+            return None
+        send({'type': 'control_request', 'request_id': 'aiusage-usage',
+              'request': {'subtype': 'get_usage', 'skip_behaviors': True}})
+        reply = wait_reply('aiusage-usage', deadline) or {}
+        if reply.get('subtype') != 'success':
+            return None
+        usage = reply.get('response')
+        return usage if isinstance(usage, dict) else None
+    except Exception:
+        return None
+    finally:
+        # stdin を閉じれば claude は自分で終わる。終わらなければ止める。
+        try:
+            proc.stdin.close()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=CREATE_NO_WINDOW, timeout=5)
+            except Exception:
+                pass
+
+
 class ClaudeProvider(Provider):
     ptype = 'claude_local'
 
@@ -356,6 +509,8 @@ class ClaudeProvider(Provider):
         # UIAでしか読めない情報（Fable週間枠・リセット文字列）を覚えておく。
         self.ui_cache = {}
         self._uia_tried = 0.0        # 最後にUIAを試した時刻（成否によらず記録）
+        self.live = None             # get_usage で読めた結果（契約の形）
+        self._live_tried = 0.0       # 最後に get_usage を試した時刻
 
     # リセット文字列ごとの保持時間
     RESET_MAX_AGE = {'reset_five_text': RESET_FIVE_MAX_AGE,
@@ -415,6 +570,10 @@ class ClaudeProvider(Provider):
         paths += glob.glob(os.path.join(
             local_appdata, 'Packages', 'Claude_*', 'LocalCache', 'Roaming',
             'Claude', 'plan-usage-history.json'))
+        # Claude アプリ 3.1623（10/23）からはここに移った。
+        paths += glob.glob(os.path.join(
+            local_appdata, 'Claude-Data', 'claude_*',
+            'plan-usage-history.json'))
         return [p for p in paths if os.path.isfile(p)]
 
     def _read_file(self, path):
@@ -466,6 +625,22 @@ class ClaudeProvider(Provider):
                 base = _merge_claude_ui(base, ui)
                 self._store_ui(ui)
         base = self._merge_ui_cache(base)
+        # ファイルは1日に数回しか書かれないので、↻ か前回から
+        # CLAUDE_LIVE_INTERVAL 秒経ったときに claude.exe へ get_usage を聞く。
+        if force or (now - self._live_tried) >= CLAUDE_LIVE_INTERVAL:
+            self._live_tried = now
+            live = _claude_live_result(_claude_live_usage(), now)
+            if live:
+                self.live = live
+        if self.live and self.live['t'] >= (base.get('t') or 0):
+            old = base
+            base = dict(self.live)
+            for key in self.RESET_MAX_AGE:      # リセットの文字は UIA の分を残す
+                if old.get(key):
+                    base[key] = old[key]
+            if base.get('fable_week') is None:  # Fable の行が無ければ UIA の分
+                base['fable_week'] = old.get('fable_week')
+                base['fable_t'] = old.get('fable_t')
         # 仕様変更: 名前クリックで使用量ページを開けるよう、ok のときも url を入れる。
         base['url'] = CLAUDE_USAGE_URL
         if base.get('ok'):
