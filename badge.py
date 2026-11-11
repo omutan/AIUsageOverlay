@@ -13,6 +13,7 @@ import tkinter.font as tkfont
 from tkinter import colorchooser
 import providers as P
 import workmeter as WM
+import askline as AL
 
 if getattr(sys, 'frozen', False):          # PyInstaller の .exe で実行時
     BASE = os.path.dirname(sys.executable)  # 設定は exe と同じ場所に置く
@@ -359,6 +360,7 @@ class Overlay:
 
         self.body = tk.Frame(inner, bg=T['card'])
         self.body.pack(fill='x')
+        self.build_askline(inner, T, s)
         self.foot = tk.Label(inner, text='', bg=T['card'], fg=T['foot'], font=self.f_small, anchor='w')
         self.foot.pack(fill='x', pady=(int(3 * s), 0))
 
@@ -503,6 +505,68 @@ class Overlay:
             row['nm'].config(text=name)
             row['tx'].config(text=it['text'], fg=(color if (it['overrun'] or it['finished']) else T['label']))
             draw_bar(row['bar'], int(66 * s), int(T['bar_h'] * s), it['pct'], color, T['track'], T['glow'])
+
+    # ---------- 聞く線（2026-11-11） ----------
+    def build_askline(self, parent, T, s):
+        """「聞く線 [－] 30分 [＋] [聞かない]」。押すと進捗フックの ask_line.json の今日の分を書く"""
+        self._askline_drawn = None
+        if not self.cfg.get('ask_line', True):
+            self.al_box = None
+            return
+        box = tk.Frame(parent, bg=T['card'])
+        box.pack(fill='x', pady=(int(5 * s), 0))
+        self.al_box = box
+        tk.Frame(box, bg=T['div'], height=1).pack(fill='x', pady=(0, int(4 * s)))
+        row = tk.Frame(box, bg=T['card'])
+        row.pack(fill='x')
+        tk.Label(row, text='聞く線', bg=T['card'], fg=T['label'], font=self.f_label).pack(side='left')
+
+        def btn(text, cmd, padx=(int(6 * s), 0)):
+            b = tk.Label(row, text=text, bg=T['track'], fg=T['sel'], font=self.f_label,
+                         cursor='hand2', padx=int(5 * s))
+            b.pack(side='left', padx=padx)
+            b.bind('<ButtonRelease-1>', lambda e: self._askline_click(cmd))
+            return b
+
+        btn('－', lambda: AL.bump(-1))
+        self.al_val = tk.Label(row, text='', bg=T['card'], fg=T['text'], font=self.f_sel,
+                               cursor='hand2', width=5)
+        self.al_val.pack(side='left', padx=(int(3 * s), 0))
+        self.al_val.bind('<ButtonRelease-1>', lambda e: self._askline_click(AL.reset))
+        btn('＋', lambda: AL.bump(+1), padx=(int(3 * s), 0))
+        self.al_no = btn('聞かない', AL.toggle_no_ask, padx=(int(8 * s), 0))
+        self.refresh_askline()
+
+    def _askline_click(self, cmd):
+        if self._drag and self._drag_moved():
+            return          # ドラッグで小窓を動かしたときは押したことにしない
+        try:
+            cmd()
+        except Exception:
+            pass
+        self.refresh_askline()
+
+    def _drag_moved(self):
+        try:
+            x0, y0, wx, wy = self._drag
+            return (int(self.cfg['x']), int(self.cfg['y'])) != (wx, wy)
+        except Exception:
+            return False
+
+    def refresh_askline(self):
+        if not getattr(self, 'al_box', None):
+            return
+        m, na = AL.state()
+        key = (m, na)
+        if key == self._askline_drawn:
+            return
+        self._askline_drawn = key
+        T = self.theme()
+        self.al_val.config(text=AL.fmt(m), fg=(T['label'] if na else T['text']))
+        if na:
+            self.al_no.config(bg=T['sel'], fg=T['card'])
+        else:
+            self.al_no.config(bg=T['track'], fg=T['sel'])
 
     def _bind_drag_tree(self, w):
         w.bind('<Button-1>', self.start_move, add='+')
@@ -751,6 +815,10 @@ class Overlay:
         # 作業メーターは経過分が変わるので、使用量より短い間隔（5秒）で読み直す
         try:
             self.refresh_work()
+        except Exception:
+            pass
+        try:
+            self.refresh_askline()     # チャットの中で変えた線・日付の変わり目も拾う
         except Exception:
             pass
         self.root.after(int(self.cfg.get('work_interval_ms', 5000)), self.tick_work)
