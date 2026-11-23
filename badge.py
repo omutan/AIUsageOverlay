@@ -535,6 +535,7 @@ class Overlay:
         self.al_val.bind('<ButtonRelease-1>', lambda e: self._askline_click(AL.reset))
         btn('＋', lambda: AL.bump(+1), padx=(int(3 * s), 0))
         self.al_no = btn('聞かない', AL.toggle_no_ask, padx=(int(8 * s), 0))
+        # 2026-11-24 本人「日付は関係ないように」→ 押した線はずっと残る（「効く長さ」の行は消した）
         self.refresh_askline()
 
     def _askline_click(self, cmd):
@@ -557,16 +558,19 @@ class Overlay:
         if not getattr(self, 'al_box', None):
             return
         m, na = AL.state()
-        key = (m, na)
+        sc = AL.scope()
+        tip = AL.tooltip()
+        key = (m, na, sc, tip)
         if key == self._askline_drawn:
             return
         self._askline_drawn = key
         T = self.theme()
         self.al_val.config(text=AL.fmt(m), fg=(T['label'] if na else T['text']))
-        if na:
-            self.al_no.config(bg=T['sel'], fg=T['card'])
-        else:
-            self.al_no.config(bg=T['track'], fg=T['sel'])
+
+        def lit(b, on):
+            b.config(bg=T['sel'], fg=T['card']) if on else b.config(bg=T['track'], fg=T['sel'])
+        lit(self.al_no, na)
+        self.update_tray_title(tip)
 
     def _bind_drag_tree(self, w):
         w.bind('<Button-1>', self.start_move, add='+')
@@ -875,14 +879,36 @@ class Overlay:
             d.ellipse((12, 12, 52, 52), fill=(197, 138, 249))
             return img
 
+        def askline_text(item):
+            try:
+                return AL.tooltip()
+            except Exception:
+                return '聞く線：—'
+
         menu = pystray.Menu(
+            pystray.MenuItem(askline_text, None, enabled=False),   # 今の聞く線（押せない1行）
             pystray.MenuItem('表示', self._tray_show, default=True),
             pystray.MenuItem('今すぐ更新', lambda i, it: self.root.after(0, self.manual_refresh)),
             pystray.MenuItem('設定', lambda i, it: self.root.after(0, self.open_settings)),
             pystray.MenuItem('終了', self._tray_quit),
         )
-        self.tray = pystray.Icon('ai_usage', make_image(), 'AI使用量オーバーレイ', menu)
+        self.tray = pystray.Icon('ai_usage', make_image(), self._tray_title_text(), menu)
         threading.Thread(target=self.tray.run, daemon=True).start()
+
+    def _tray_title_text(self, tip=None):
+        """トレイのアイコンにマウスを乗せたときの文字。2行目に今の聞く線（2026-11-19）"""
+        try:
+            tip = tip or AL.tooltip()
+        except Exception:
+            tip = None
+        return 'AI使用量オーバーレイ' + (f'\n{tip}' if tip else '')
+
+    def update_tray_title(self, tip=None):
+        try:
+            if self.tray:
+                self.tray.title = self._tray_title_text(tip)
+        except Exception:
+            pass
 
     def _tray_show(self, icon=None, item=None):
         self.root.after(0, self.show_window)
